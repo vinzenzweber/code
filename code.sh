@@ -53,6 +53,7 @@ RUN_INIT=false
 TARGET_ISSUE=""
 SELECTION_HINT=""
 MAX_REVIEW_ROUNDS=10
+MAX_CI_FIX_ATTEMPTS=5
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -179,7 +180,7 @@ PHASE_LABELS=(
     "auto-dev:verifying|BFD4F2|Production verification"
     "auto-dev:complete|0E8A16|Successfully completed"
     "auto-dev:blocked|B60205|Needs manual intervention"
-    "auto-dev:ci-failed|B60205|CI checks failing"
+    "auto-dev:ci-failed|FBCA04|CI checks failing, attempting fixes"
 )
 
 # Ensure all required labels exist in the repo with correct colors and descriptions
@@ -1381,6 +1382,140 @@ wait_for_ci() {
 }
 
 #─────────────────────────────────────────────────────────────────────
+# SESSION: Fix CI Failures
+# Context: Clean - focused on CI error analysis and fixes
+#─────────────────────────────────────────────────────────────────────
+fix_ci_failures() {
+    local pr_num=$1
+    local issue_num=$2
+    local attempt=$3
+
+    header "SESSION: Fixing CI Failures (Attempt $attempt/$MAX_CI_FIX_ATTEMPTS)"
+    set_phase "$issue_num" "ci-failed"
+    log "Analyzing and fixing CI failures for PR #$pr_num..."
+
+    local session_start
+    session_start=$(date +%s)
+
+    # Get the branch name for this PR
+    local branch_name
+    branch_name=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null || echo "")
+
+    # Checkout the PR branch
+    if [ -n "$branch_name" ]; then
+        log "Checking out branch: $branch_name"
+        git fetch origin "$branch_name" 2>&1 | head -3 >&2 || true
+        git checkout "$branch_name" 2>&1 | head -3 >&2 || true
+        git pull origin "$branch_name" 2>&1 | head -3 >&2 || true
+    fi
+
+    # Fetch CI check details
+    local ci_checks
+    ci_checks=$(gh pr checks "$pr_num" 2>&1 || echo "")
+
+    # Get the failed check run URLs
+    local failed_jobs
+    failed_jobs=$(echo "$ci_checks" | grep -E "fail|X" | head -5 || echo "")
+
+    run_claude "
+Fix the CI failures for PR #$pr_num (Attempt $attempt of $MAX_CI_FIX_ATTEMPTS).
+
+## Current CI Status
+\`\`\`
+$ci_checks
+\`\`\`
+
+## Failed Jobs
+$failed_jobs
+
+## Your Task
+
+1. **Fetch CI Logs**
+   - Get the workflow run ID from the PR:
+     gh pr view $pr_num --json statusCheckRollup -q '.statusCheckRollup[] | select(.conclusion == \"FAILURE\") | .detailsUrl'
+   - Or list recent workflow runs:
+     gh run list --limit 5
+   - View failed run logs:
+     gh run view <run-id> --log-failed 2>&1 | head -200
+
+2. **Analyze Failures**
+   - Read the error messages carefully
+   - Identify the root cause (test failures, lint errors, build errors, type errors)
+
+3. **Fix the Issues**
+   - For test failures: Read the failing test and the code it tests, fix the bug
+   - For lint errors: Run 'npm run lint' locally, fix all issues
+   - For build errors: Run 'npm run build' locally, fix all issues
+   - For type errors: Fix TypeScript errors
+
+4. **Verify Locally**
+   - Run: npm run lint
+   - Run: npm run build
+   - Run: npm run test:unit
+   - ALL must pass before committing
+
+5. **Commit and Push**
+   - git add <fixed-files>
+   - git commit --no-gpg-sign -m 'fix: resolve CI failures'
+   - git push
+
+**Git Configuration (CRITICAL):**
+- Always use --no-gpg-sign for commits
+- You are already on the correct branch
+
+**IMPORTANT:** Do NOT create new branches. Push directly to the existing PR branch.
+
+$(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
+
+Output 'CI_FIXES_PUSHED' when fixes are committed and pushed.
+" > /dev/null
+
+    local session_end
+    session_end=$(date +%s)
+
+    # Post session memory
+    post_session_memory "$issue_num" "Fix CI Failures (Attempt $attempt)" "$session_start" "$session_end" "${SESSION_COST:-0}" \
+        "Analyzed CI failures and pushed fixes for PR #$pr_num."
+
+    success "CI fixes pushed (attempt $attempt)"
+}
+
+#─────────────────────────────────────────────────────────────────────
+# CI Fix Loop
+# Waits for CI, fixes failures, repeats until success or max attempts
+#─────────────────────────────────────────────────────────────────────
+run_ci_fix_loop() {
+    local pr_num=$1
+    local issue_num=$2
+    local attempt=0
+
+    while [ $attempt -lt $MAX_CI_FIX_ATTEMPTS ]; do
+        # Wait for CI to complete
+        if wait_for_ci "$pr_num"; then
+            success "CI checks passed!"
+            return 0
+        fi
+
+        # CI failed - try to fix
+        attempt=$((attempt + 1))
+
+        if [ $attempt -ge $MAX_CI_FIX_ATTEMPTS ]; then
+            error "Max CI fix attempts ($MAX_CI_FIX_ATTEMPTS) reached"
+            return 1
+        fi
+
+        log "CI failed, attempting fix ($attempt/$MAX_CI_FIX_ATTEMPTS)..."
+        fix_ci_failures "$pr_num" "$issue_num" "$attempt"
+
+        # Brief pause before re-checking CI
+        log "Waiting for new CI run to start..."
+        sleep 10
+    done
+
+    return 1
+}
+
+#─────────────────────────────────────────────────────────────────────
 # SESSION 4: Code Review
 # Context: CLEAN - Critical for quality!
 # Fresh eyes review without implementation bias
@@ -1980,14 +2115,25 @@ resume_from_phase() {
                 mark_blocked "$issue_num" "No PR number found"
                 return 1
             fi
-            if wait_for_ci "$pr_num"; then
+            if run_ci_fix_loop "$pr_num" "$issue_num"; then
                 resume_from_phase "$issue_num" "reviewing"
             else
-                set_phase "$issue_num" "ci-failed"
-                mark_blocked "$issue_num" "CI checks failed"
+                mark_blocked "$issue_num" "CI checks failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
             fi
             ;;
-        "reviewing"|"ci-failed")
+        "ci-failed")
+            if [ -z "$pr_num" ]; then
+                mark_blocked "$issue_num" "No PR number found"
+                return 1
+            fi
+            # Resume CI fix loop from where we left off
+            if run_ci_fix_loop "$pr_num" "$issue_num"; then
+                resume_from_phase "$issue_num" "reviewing"
+            else
+                mark_blocked "$issue_num" "CI checks failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
+            fi
+            ;;
+        "reviewing")
             if [ -z "$pr_num" ]; then
                 mark_blocked "$issue_num" "No PR number found"
                 return 1
@@ -2001,10 +2147,10 @@ resume_from_phase() {
                 return 1
             fi
             fix_review_feedback "$pr_num" "$issue_num"
-            if wait_for_ci "$pr_num"; then
+            if run_ci_fix_loop "$pr_num" "$issue_num"; then
                 resume_from_phase "$issue_num" "reviewing"
             else
-                mark_blocked "$issue_num" "CI failed after fixes"
+                mark_blocked "$issue_num" "CI failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
             fi
             ;;
         "merging")
@@ -2059,9 +2205,9 @@ run_review_loop() {
             # Fix feedback
             fix_review_feedback "$pr_num" "$issue_num"
 
-            # Re-run CI after fixes
-            if ! wait_for_ci "$pr_num"; then
-                mark_blocked "$issue_num" "CI failed after fixes"
+            # Re-run CI after fixes (with fix loop)
+            if ! run_ci_fix_loop "$pr_num" "$issue_num"; then
+                mark_blocked "$issue_num" "CI failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
                 return 1
             fi
         else
@@ -2209,8 +2355,8 @@ main() {
             continue
         fi
 
-        if ! wait_for_ci "$pr_num"; then
-            mark_blocked "$issue_num" "CI checks failed"
+        if ! run_ci_fix_loop "$pr_num" "$issue_num"; then
+            mark_blocked "$issue_num" "CI checks failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
             continue
         fi
 
