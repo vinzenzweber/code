@@ -597,7 +597,7 @@ format_progress() {
 # Logs all raw JSON output to LOG_FILE for debugging
 run_claude() {
     local prompt_preview
-    prompt_preview=$(echo "$1" | head -c 100 | tr '\n' ' ')
+    prompt_preview=$(printf '%s' "$1" | head -c 100 | tr '\n' ' ') 2>/dev/null
 
     # Track session start
     SESSION_START_TIME=$(date +%s)
