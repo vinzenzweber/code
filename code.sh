@@ -2116,6 +2116,8 @@ resume_from_phase() {
                 return 1
             fi
             if run_ci_fix_loop "$pr_num" "$issue_num"; then
+                # Reset review round counter - fresh CI means fresh review
+                set_metadata "$issue_num" "round" "0"
                 resume_from_phase "$issue_num" "reviewing"
             else
                 mark_blocked "$issue_num" "CI checks failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
@@ -2128,6 +2130,8 @@ resume_from_phase() {
             fi
             # Resume CI fix loop from where we left off
             if run_ci_fix_loop "$pr_num" "$issue_num"; then
+                # Reset review round counter - fresh CI means fresh review
+                set_metadata "$issue_num" "round" "0"
                 resume_from_phase "$issue_num" "reviewing"
             else
                 mark_blocked "$issue_num" "CI checks failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
@@ -2148,6 +2152,7 @@ resume_from_phase() {
             fi
             fix_review_feedback "$pr_num" "$issue_num"
             if run_ci_fix_loop "$pr_num" "$issue_num"; then
+                # Don't reset round here - we're continuing the same review cycle
                 resume_from_phase "$issue_num" "reviewing"
             else
                 mark_blocked "$issue_num" "CI failed after $MAX_CI_FIX_ATTEMPTS fix attempts"
@@ -2187,6 +2192,14 @@ run_review_loop() {
     local review_round
     review_round=$(get_metadata "$issue_num" "round")
     review_round=${review_round:-0}
+
+    # Safety check: if round counter is already at or past max, reset it
+    # This can happen if resuming after a failed run or stale metadata
+    if [ "$review_round" -ge "$MAX_REVIEW_ROUNDS" ]; then
+        warn "Review round counter ($review_round) >= max ($MAX_REVIEW_ROUNDS), resetting to 0"
+        review_round=0
+        set_metadata "$issue_num" "round" "0"
+    fi
 
     while [ "$review_round" -lt "$MAX_REVIEW_ROUNDS" ]; do
         review_round=$((review_round + 1))
