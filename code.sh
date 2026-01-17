@@ -816,20 +816,52 @@ run_triage_session() {
     # (handles case where --init was never run)
     ensure_labels_exist
 
-    local feedback_issues
-    feedback_issues=$(find_untriaged_feedback_issues)
+    # Collect ALL issues that need triage:
+    # 1. New untriaged feedback (no triage labels)
+    # 2. Issues stuck in pending/analyzing from previous runs
+    local new_issues in_progress_issues all_triage_issues=""
 
-    if [ -z "$feedback_issues" ]; then
+    new_issues=$(find_untriaged_feedback_issues)
+    in_progress_issues=$(find_triage_in_progress)
+
+    # Combine lists (new issues first, then in-progress)
+    if [ -n "$new_issues" ]; then
+        # Format: issue_num|title
+        all_triage_issues="$new_issues"
+    fi
+
+    if [ -n "$in_progress_issues" ]; then
+        # in_progress format is: issue_num|triage:phase|title
+        # Convert to: issue_num|title for consistent processing
+        local converted_in_progress
+        converted_in_progress=$(echo "$in_progress_issues" | while IFS='|' read -r num phase title; do
+            [ -z "$num" ] && continue
+            echo "$num|$title"
+        done)
+        if [ -n "$converted_in_progress" ]; then
+            if [ -n "$all_triage_issues" ]; then
+                all_triage_issues="$all_triage_issues"$'\n'"$converted_in_progress"
+            else
+                all_triage_issues="$converted_in_progress"
+            fi
+        fi
+    fi
+
+    if [ -z "$all_triage_issues" ]; then
         log "No user-feedback issues to triage"
         return 0
     fi
 
-    local count
-    count=$(echo "$feedback_issues" | wc -l | tr -d ' ')
-    log "Found $count user-feedback issue(s) to triage"
+    local count new_count in_progress_count
+    count=$(echo "$all_triage_issues" | wc -l | tr -d ' ')
+    new_count=$([ -n "$new_issues" ] && echo "$new_issues" | wc -l | tr -d ' ' || echo "0")
+    in_progress_count=$([ -n "$in_progress_issues" ] && echo "$in_progress_issues" | wc -l | tr -d ' ' || echo "0")
+    log "Found $count user-feedback issue(s) to triage ($new_count new, $in_progress_count resuming)"
 
     # Process each feedback issue
-    while IFS='|' read -r issue_num issue_title; do
+    # Note: Using fd 3 to avoid stdin consumption by commands inside the loop
+    # (run_claude and other commands may read from stdin, consuming remaining issues)
+    while IFS='|' read -r -u 3 issue_num issue_title; do
         [ -z "$issue_num" ] && continue
 
         log "Processing feedback: #$issue_num - $issue_title"
@@ -843,7 +875,7 @@ run_triage_session() {
 
         # Brief pause between issues
         sleep 2
-    done <<< "$feedback_issues"
+    done 3<<< "$all_triage_issues"
 
     success "Triage session complete"
 }
