@@ -43,97 +43,105 @@ Guide issue prioritization with natural language:
 
 The workflow separates work into distinct Claude Code sessions with intentional context boundaries:
 
+```mermaid
+flowchart TD
+    subgraph TRIAGE["🔍 SESSION 0: User Feedback Triage"]
+        T0[/"Loop ALL 'user-feedback' issues"/]
+        T1["Analyze scope, create atomic issues"]
+        T2["Close parent or convert to Epic"]
+        T0 --> T1 --> T2
+    end
+
+    subgraph SELECT["📋 SESSION 1: Issue Selection"]
+        S1["Fetch open GitHub issues"]
+        S2["Skip 'user-feedback' issues"]
+        S3["Pick best atomic issue"]
+    end
+
+    subgraph PLAN["📝 SESSION 2: Planning"]
+        P1["Explore codebase"]
+        P2["Create implementation plan"]
+        P3["Post plan as issue comment"]
+    end
+
+    subgraph IMPLEMENT["⚡ SESSION 3: Implementation"]
+        I1["Implement feature"]
+        I2["Run lint, build, tests"]
+        I3["Manual testing via Playwright"]
+        I4["Create PR"]
+    end
+
+    subgraph CI["⏳ CI WAIT"]
+        C1["Poll gh pr checks"]
+        C2["30s intervals, 15min max"]
+    end
+
+    subgraph REVIEW["👁️ SESSION 4: Code Review"]
+        R1["Fresh eyes review"]
+        R2["Security & correctness checks"]
+        R3{"Approved?"}
+    end
+
+    subgraph FIX["🔧 SESSION 5: Fix Feedback"]
+        F1["Address review comments"]
+        F2["Push fixes"]
+    end
+
+    subgraph DOCS["📚 SESSION 7: Documentation"]
+        D1["Update CLAUDE.md if needed"]
+        D2["Wait for CI if changed"]
+    end
+
+    subgraph DEPLOY["🚀 SESSION 6: Merge & Deploy"]
+        M1["Squash merge PR"]
+        M2["Wait for Railway deploy"]
+        M3["Verify in production"]
+    end
+
+    COMPLETE((✅ Complete))
+
+    TRIAGE -->|"--triage flag"| EXIT((Exit))
+    TRIAGE -->|"All triaged"| SELECT
+    SELECT --> PLAN
+    PLAN --> IMPLEMENT
+    IMPLEMENT --> CI
+    CI --> REVIEW
+    R3 -->|"Changes"| FIX
+    FIX --> CI
+    R3 -->|"Approved"| DOCS
+    DOCS --> DEPLOY
+    DEPLOY --> COMPLETE
+
+    style TRIAGE fill:#e1f5fe,stroke:#01579b
+    style SELECT fill:#e1f5fe,stroke:#01579b
+    style PLAN fill:#e1f5fe,stroke:#01579b
+    style REVIEW fill:#e1f5fe,stroke:#01579b
+    style FIX fill:#e1f5fe,stroke:#01579b
+    style DOCS fill:#e1f5fe,stroke:#01579b
+    style IMPLEMENT fill:#fff3e0,stroke:#e65100
+    style DEPLOY fill:#fff3e0,stroke:#e65100
+    style CI fill:#f5f5f5,stroke:#616161
+    style COMPLETE fill:#c8e6c9,stroke:#2e7d32
+    style EXIT fill:#ffcdd2,stroke:#c62828
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 0: User Feedback Triage (runs first, every cycle)      │
-│  Context: Clean                                                 │
-│  • Loop through ALL issues labeled 'user-feedback'              │
-│  • For each: analyze scope, create atomic child issues          │
-│  • Close parent or convert to Epic                              │
-│  • Only proceeds after ALL feedback is triaged                  │
-│  → Labels: auto-dev:triage:pending → analyzing → complete       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              (if --triage flag, exit here)
-                              │
-            (only after ALL feedback processed)
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 1: Issue Selection                                     │
-│  Context: Clean                                                 │
-│  • Fetch open GitHub issues                                     │
-│  • Skip issues labeled 'user-feedback' (require triage)         │
-│  • Pick from atomic issues created by triage                    │
-│  • Analyze priority, complexity, dependencies                   │
-│  → Labels: auto-dev:selecting                                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 2: Planning                                            │
-│  Context: Clean (print mode, non-interactive)                   │
-│  • Explore codebase                                             │
-│  • Create implementation plan                                   │
-│  • Post plan as GitHub issue comment                            │
-│  → Labels: auto-dev:planning                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 3: Implementation + Testing + PR                       │
-│  Context: SHARED (tight feedback loop)                          │
-│  • Implement feature                                            │
-│  • Run lint, build, unit tests, E2E tests                       │
-│  • Manual testing with Playwright MCP                           │
-│  • Create PR                                                    │
-│  → Labels: auto-dev:implementing → auto-dev:pr-waiting          │
-│  → Metadata: auto-dev:branch:<name>                             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  CI WAIT (not a Claude session)                                 │
-│  • gh pr checks (polls every 30s, max 15 min)                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 4: Code Review                                         │
-│  Context: CLEAN (critical for quality!)                         │
-│  • Fresh eyes review                                            │
-│  • No implementation bias                                       │
-│  • Security, correctness, testing, KISS checks                  │
-│  • Sets signal label for status                                 │
-│  → Labels: auto-dev:reviewing                                   │
-│  → Signals: auto-dev:signal:review-approved or review-changes   │
-│  → Metadata: auto-dev:round:<n>                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-          [Changes Requested]      [Approved]
-                    │                   │
-                    ▼                   ▼
-┌───────────────────────────────┐ ┌─────────────────────────────────┐
-│  SESSION 5: Fix Feedback      │ │  SESSION 7: Documentation       │
-│  → Labels: auto-dev:fixing    │ │  Context: Clean                 │
-│  • Address review comments    │ │  • Check if CLAUDE.md needs     │
-│  • Push fixes                 │ │    updates (on feature branch)  │
-│  • Loop back to CI            │ │  • If updated, wait for CI      │
-└───────────────────────────────┘ └─────────────────────────────────┘
-                                        │
-                                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 6: Merge + Deploy + Verify                             │
-│  Context: Shared                                                │
-│  • Merge PR (squash)                                            │
-│  • Wait for Railway deployment                                  │
-│  • Verify in production via Playwright MCP                      │
-│  → Labels: auto-dev:merging → auto-dev:verifying → complete     │
-│  → Metadata: auto-dev:cost:<total>                              │
-└─────────────────────────────────────────────────────────────────┘
-```
+
+**Context Types:**
+- 🔵 **Clean Context** (blue): Fresh session, no prior bias — critical for objective review
+- 🟠 **Shared Context** (orange): Maintains state for tight feedback loops
+- ⬜ **No Claude** (gray): Script-only operations
+
+### Session Details
+
+| Session | Context | Labels | Purpose |
+|---------|---------|--------|---------|
+| **0: Triage** | Clean | `triage:pending` → `analyzing` → `complete` | Break down user feedback into atomic issues |
+| **1: Selection** | Clean | `selecting` | Pick highest-priority actionable issue |
+| **2: Planning** | Clean | `planning` | Explore codebase, create implementation plan |
+| **3: Implementation** | Shared | `implementing` → `pr-waiting` | Code, test, create PR |
+| **4: Review** | Clean | `reviewing` + `round:<n>` | Objective code review without implementation bias |
+| **5: Fix** | Clean | `fixing` | Address review feedback |
+| **6: Deploy** | Shared | `merging` → `verifying` → `complete` | Merge, deploy, verify in production |
+| **7: Docs** | Clean | — | Update CLAUDE.md on feature branch |
 
 ## GitHub Memory System
 
