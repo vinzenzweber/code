@@ -13,6 +13,7 @@
 #   - Multi-machine support (all state in GitHub)
 #
 # Session Architecture:
+#   0. User Feedback Triage (clean context - runs first each cycle)
 #   1. Issue Selection (clean context)
 #   2. Planning (clean context)
 #   3. Implementation + Testing + PR (shared context - tight feedback loop)
@@ -22,12 +23,13 @@
 #   7. Documentation (optional)
 #
 # Usage:
-#   ./code.sh              # Run continuous loop
-#   ./code.sh --once       # Run single cycle
+#   ./code.sh              # Run continuous loop (triage → select → dev)
+#   ./code.sh --once       # Run single cycle including triage
 #   ./code.sh -i 42        # Work on specific issue (implies --once)
 #   ./code.sh --issue 42   # Same as above
 #   ./code.sh --resume     # Resume in-progress work only
-#   ./code.sh --status     # Show status of in-progress issues
+#   ./code.sh --status     # Show triage and dev status
+#   ./code.sh --triage     # Triage-only mode, then exit
 #   ./code.sh --hint "..." # Provide priority hint for issue selection
 #   ./code.sh --init       # Run initial setup (GitHub labels, etc.) - once per repo
 #
@@ -52,8 +54,11 @@ SHOW_STATUS=false
 RUN_INIT=false
 TARGET_ISSUE=""
 SELECTION_HINT=""
+RUN_TRIAGE_ONLY=false
 MAX_REVIEW_ROUNDS=10
 MAX_CI_FIX_ATTEMPTS=5
+HUMAN_REVIEW_TIMEOUT=60  # Minutes to wait for human reviewers
+HUMAN_REVIEW_POLL=60     # Seconds between polling for human reviews
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -91,9 +96,13 @@ while [[ $# -gt 0 ]]; do
             SELECTION_HINT="$2"
             shift 2
             ;;
+        --triage)
+            RUN_TRIAGE_ONLY=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--once] [-i|--issue <number>] [--resume] [--status] [--init] [--hint \"...\"]"
+            echo "Usage: $0 [--once] [-i|--issue <number>] [--resume] [--status] [--init] [--hint \"...\"] [--triage]"
             exit 1
             ;;
     esac
@@ -183,19 +192,54 @@ PHASE_LABELS=(
     "auto-dev:ci-failed|FBCA04|CI checks failing, attempting fixes"
 )
 
+# Signal labels: used by Claude sessions to signal completion status
+# These are consumed (removed) after being read by the script
+SIGNAL_LABELS=(
+    "auto-dev:signal:review-approved|0E8A16|Review approved, ready to merge"
+    "auto-dev:signal:review-changes|D93F0B|Review requests changes"
+    "auto-dev:signal:needs-update|FBCA04|PR needs updates after verification"
+)
+
+# Triage labels: for user-feedback issue triage workflow
+TRIAGE_LABELS=(
+    "auto-dev:triage:pending|C5DEF5|Feedback awaiting triage"
+    "auto-dev:triage:analyzing|1D76DB|Being analyzed for scope"
+    "auto-dev:triage:complete|0E8A16|Triage complete, issues created"
+    "auto-dev:triage:blocked|B60205|Triage needs manual intervention"
+)
+
 # Ensure all required labels exist in the repo with correct colors and descriptions
 ensure_labels_exist() {
     log "Ensuring GitHub labels exist..."
     local created=0
     local updated=0
 
+    # Create phase labels
     for label_spec in "${PHASE_LABELS[@]}"; do
         IFS='|' read -r name color desc <<< "$label_spec"
-        # Try to create the label
         if gh label create "$name" --color "$color" --description "$desc" 2>/dev/null; then
             created=$((created + 1))
         else
-            # Label exists - update it to ensure correct color and description
+            gh label edit "$name" --color "$color" --description "$desc" 2>/dev/null && updated=$((updated + 1))
+        fi
+    done
+
+    # Create signal labels
+    for label_spec in "${SIGNAL_LABELS[@]}"; do
+        IFS='|' read -r name color desc <<< "$label_spec"
+        if gh label create "$name" --color "$color" --description "$desc" 2>/dev/null; then
+            created=$((created + 1))
+        else
+            gh label edit "$name" --color "$color" --description "$desc" 2>/dev/null && updated=$((updated + 1))
+        fi
+    done
+
+    # Create triage labels
+    for label_spec in "${TRIAGE_LABELS[@]}"; do
+        IFS='|' read -r name color desc <<< "$label_spec"
+        if gh label create "$name" --color "$color" --description "$desc" 2>/dev/null; then
+            created=$((created + 1))
+        else
             gh label edit "$name" --color "$color" --description "$desc" 2>/dev/null && updated=$((updated + 1))
         fi
     done
@@ -203,6 +247,40 @@ ensure_labels_exist() {
     if [ $created -gt 0 ] || [ $updated -gt 0 ]; then
         log "Labels: $created created, $updated updated"
     fi
+}
+
+# Check if a signal label is set on an issue
+has_signal() {
+    local issue_num=$1
+    local signal=$2
+    local labels
+    labels=$(gh issue view "$issue_num" --json labels -q '.labels[].name' 2>/dev/null || echo "")
+    echo "$labels" | grep -q "^auto-dev:signal:$signal$"
+}
+
+# Set a signal label on an issue
+set_signal() {
+    local issue_num=$1
+    local signal=$2
+    gh label create "auto-dev:signal:$signal" --color "CCCCCC" 2>/dev/null || true
+    gh issue edit "$issue_num" --add-label "auto-dev:signal:$signal" >/dev/null 2>&1 || true
+}
+
+# Clear a signal label from an issue (consume the signal)
+clear_signal() {
+    local issue_num=$1
+    local signal=$2
+    gh issue edit "$issue_num" --remove-label "auto-dev:signal:$signal" >/dev/null 2>&1 || true
+}
+
+# Clear all signal labels from an issue
+clear_all_signals() {
+    local issue_num=$1
+    local labels
+    labels=$(gh issue view "$issue_num" --json labels -q '.labels[].name' 2>/dev/null | grep "^auto-dev:signal:" || true)
+    for label in $labels; do
+        gh issue edit "$issue_num" --remove-label "$label" >/dev/null 2>&1 || true
+    done
 }
 
 # Set workflow phase for an issue (removes old phase, adds new)
@@ -268,6 +346,21 @@ get_metadata() {
     local labels
     labels=$(gh issue view "$issue_num" --json labels -q ".labels[].name" 2>/dev/null) || true
     echo "$labels" | grep "^auto-dev:$key:" | sed "s/auto-dev:$key://" | head -1 || true
+}
+
+# Validate and sanitize a PR number
+# Returns clean numeric PR number or empty string if invalid
+# Usage: clean_pr=$(validate_pr_number "$pr_num")
+validate_pr_number() {
+    local input=$1
+    # Extract only the numeric part (last number in the string)
+    local num
+    num=$(echo "$input" | grep -oE '[0-9]+' | tail -1)
+    if [ -n "$num" ] && [ "$num" -gt 0 ] 2>/dev/null; then
+        echo "$num"
+    else
+        echo ""
+    fi
 }
 
 # Post session memory as a structured comment
@@ -375,29 +468,59 @@ find_resumable_issue() {
 show_status() {
     header "Auto-Dev Status"
 
+    # Show triage status first
+    local untriaged triage_in_progress
+    untriaged=$(find_untriaged_feedback_issues)
+    triage_in_progress=$(find_triage_in_progress)
+
+    if [ -n "$untriaged" ] || [ -n "$triage_in_progress" ]; then
+        echo ""
+        echo -e "${BOLD}Triage Queue:${NC}"
+        printf "%-6s %-20s %-45s\n" "ISSUE" "STATUS" "TITLE"
+        printf "%-6s %-20s %-45s\n" "-----" "------" "-----"
+
+        if [ -n "$untriaged" ]; then
+            while IFS='|' read -r num title; do
+                [ -z "$num" ] && continue
+                printf "%-6s %-20s %-45s\n" "#$num" "awaiting triage" "${title:0:45}"
+            done <<< "$untriaged"
+        fi
+
+        if [ -n "$triage_in_progress" ]; then
+            while IFS='|' read -r num phase title; do
+                [ -z "$num" ] && continue
+                printf "%-6s %-20s %-45s\n" "#$num" "$phase" "${title:0:45}"
+            done <<< "$triage_in_progress"
+        fi
+        echo ""
+    fi
+
+    # Show development status
     local in_progress
     in_progress=$(find_in_progress_issues)
 
-    if [ -z "$in_progress" ]; then
+    if [ -z "$in_progress" ] && [ -z "$untriaged" ] && [ -z "$triage_in_progress" ]; then
         log "No in-progress issues found"
         return 0
     fi
 
-    echo ""
-    printf "%-6s %-15s %-50s\n" "ISSUE" "PHASE" "TITLE"
-    printf "%-6s %-15s %-50s\n" "-----" "-----" "-----"
+    if [ -n "$in_progress" ]; then
+        echo -e "${BOLD}Development Queue:${NC}"
+        printf "%-6s %-15s %-50s\n" "ISSUE" "PHASE" "TITLE"
+        printf "%-6s %-15s %-50s\n" "-----" "-----" "-----"
 
-    while IFS='|' read -r num phase title; do
-        local pr_num branch cost
-        pr_num=$(get_metadata "$num" "pr")
-        cost=$(get_accumulated_cost "$num")
+        while IFS='|' read -r num phase title; do
+            local pr_num branch cost
+            pr_num=$(get_metadata "$num" "pr")
+            cost=$(get_accumulated_cost "$num")
 
-        printf "%-6s %-15s %-50s\n" "#$num" "$phase" "${title:0:50}"
-        if [ -n "$pr_num" ]; then
-            printf "       └─ PR #%s, Cost: \$%s\n" "$pr_num" "$cost"
-        fi
-    done <<< "$in_progress"
-    echo ""
+            printf "%-6s %-15s %-50s\n" "#$num" "$phase" "${title:0:50}"
+            if [ -n "$pr_num" ]; then
+                printf "       └─ PR #%s, Cost: \$%s\n" "$pr_num" "$cost"
+            fi
+        done <<< "$in_progress"
+        echo ""
+    fi
 }
 
 # Mark issue as blocked
@@ -424,6 +547,282 @@ mark_blocked() {
 <sub>🤖 Automated by auto-dev</sub>" >/dev/null 2>&1 || true
 
     error "Issue #$issue_num blocked: $reason"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# USER FEEDBACK TRIAGE SYSTEM
+# Processes issues labeled 'user-feedback' into atomic development tasks
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Find user-feedback issues that haven't been triaged yet
+# Returns: issue_num|title format, one per line
+find_untriaged_feedback_issues() {
+    # Find issues with 'user-feedback' label but NO triage labels
+    local feedback_issues
+    feedback_issues=$(gh issue list --label "user-feedback" --state open --json number,title,labels \
+        -q '.[] | select(.labels | map(.name) | any(startswith("auto-dev:triage:")) | not) | "\(.number)|\(.title)"' 2>/dev/null || echo "")
+    echo "$feedback_issues"
+}
+
+# Find user-feedback issues currently being triaged
+find_triage_in_progress() {
+    local phases=("pending" "analyzing")
+
+    for phase in "${phases[@]}"; do
+        local issues
+        issues=$(gh issue list --label "auto-dev:triage:$phase" --json number,title -q '.[] | "\(.number)|\(.title)"' 2>/dev/null || echo "")
+        if [ -n "$issues" ]; then
+            while IFS= read -r line; do
+                local num title
+                num=$(echo "$line" | cut -d'|' -f1)
+                title=$(echo "$line" | cut -d'|' -f2-)
+                echo "$num|triage:$phase|$title"
+            done <<< "$issues"
+        fi
+    done
+}
+
+# Set triage phase for an issue (removes old triage phase, adds new)
+set_triage_phase() {
+    local issue_num=$1
+    local phase=$2
+
+    # Remove all existing triage phase labels
+    local existing_labels
+    existing_labels=$(gh issue view "$issue_num" --json labels -q '.labels[].name' 2>/dev/null | grep "^auto-dev:triage:" || true)
+
+    for old_label in $existing_labels; do
+        gh issue edit "$issue_num" --remove-label "$old_label" >/dev/null 2>&1 || true
+    done
+
+    # Add new triage phase label
+    gh issue edit "$issue_num" --add-label "auto-dev:triage:$phase" >/dev/null 2>&1 || true
+    log "Triage phase → ${MAGENTA}$phase${NC} for issue #$issue_num"
+}
+
+# Get current triage phase of an issue
+get_triage_phase() {
+    local issue_num=$1
+    local labels
+    labels=$(gh issue view "$issue_num" --json labels -q '.labels[].name' 2>/dev/null || echo "")
+
+    for phase in pending analyzing complete blocked; do
+        if echo "$labels" | grep -q "^auto-dev:triage:$phase$"; then
+            echo "$phase"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# Triage a single user-feedback issue
+# Analyzes scope, creates atomic child issues, returns recommendation
+triage_feedback_issue() {
+    local issue_num=$1
+
+    log "Triaging user feedback issue #$issue_num..."
+    set_triage_phase "$issue_num" "analyzing"
+
+    local session_start
+    session_start=$(date +%s)
+
+    # Get issue details
+    local issue_json
+    issue_json=$(gh issue view "$issue_num" --json title,body,comments 2>/dev/null) || issue_json="{}"
+    local issue_title issue_body
+    issue_title=$(echo "$issue_json" | jq -r '.title // "Unknown"' 2>/dev/null) || issue_title="Unknown"
+    issue_body=$(echo "$issue_json" | jq -r '.body // ""' 2>/dev/null) || issue_body=""
+
+    local raw_output
+    raw_output=$(run_claude "
+You are triaging a user feedback issue for the habits/fitstreak project.
+
+## Issue #$issue_num: $issue_title
+
+$issue_body
+
+## Your Task
+
+Analyze this feedback and determine:
+1. **Scope Assessment**: Is this small (1 atomic issue), medium (2-4 issues), or epic (5+ issues)?
+2. **Actionability**: Can we act on this feedback, or does it need clarification?
+
+## Actions Based on Analysis
+
+### If feedback is CLEAR and ACTIONABLE:
+Create atomic child issues using:
+\`\`\`bash
+gh issue create --title \"Title here\" --body \"Body here\" --label \"priority-label\"
+\`\`\`
+
+Each child issue should:
+- Be small and well-defined (completable in one development session)
+- Have a clear title starting with a verb (Add, Fix, Update, Implement, etc.)
+- Reference the parent: 'Part of #$issue_num'
+- Have appropriate priority label (P0-foundation, P1-core, P2-enhancement, P3-future)
+
+### If feedback NEEDS CLARIFICATION:
+Add a comment asking for specifics:
+\`\`\`bash
+gh issue comment $issue_num --body \"Thanks for the feedback! To help us prioritize, could you clarify: [specific questions]\"
+\`\`\`
+
+## Output Format
+
+After your analysis and actions, output ONLY this JSON (no markdown, no explanation):
+{
+    \"scope\": \"small|medium|epic|unclear\",
+    \"issues_created\": [123, 124, 125],
+    \"recommendation\": \"close|convert_to_epic|needs_clarification\",
+    \"summary\": \"Brief summary of what was done\"
+}
+
+Where:
+- 'close': Feedback fully addressed by child issues, can close parent
+- 'convert_to_epic': Large scope, rename to 'Epic: ...' and keep open as tracker
+- 'needs_clarification': Asked user for more info, pause triage
+")
+
+    local session_end
+    session_end=$(date +%s)
+
+    # Extract JSON result
+    local triage_result
+    triage_result=$(echo "$raw_output" | grep -E '^\{.*\}$' | tail -1) || true
+
+    if [ -z "$triage_result" ]; then
+        # Try to find JSON anywhere in output
+        triage_result=$(echo "$raw_output" | tr '\n' ' ' | grep -oE '\{[^{}]*"recommendation"[^{}]*\}' | head -1) || true
+    fi
+
+    if [ -z "$triage_result" ]; then
+        warn "Could not extract triage result JSON"
+        set_triage_phase "$issue_num" "blocked"
+        return 1
+    fi
+
+    # Post session memory
+    local summary
+    summary=$(echo "$triage_result" | jq -r '.summary // "Triage completed"' 2>/dev/null) || summary="Triage completed"
+    post_session_memory "$issue_num" "Triage Analysis" "$session_start" "$session_end" "${SESSION_COST:-0}" "$summary"
+
+    # Store result for complete_triage
+    echo "$triage_result"
+}
+
+# Complete the triage based on recommendation
+complete_triage() {
+    local issue_num=$1
+    local triage_result=$2
+
+    local recommendation scope issues_created summary
+    recommendation=$(echo "$triage_result" | jq -r '.recommendation // "close"' 2>/dev/null) || recommendation="close"
+    scope=$(echo "$triage_result" | jq -r '.scope // "small"' 2>/dev/null) || scope="small"
+    issues_created=$(echo "$triage_result" | jq -r '.issues_created // [] | join(", ")' 2>/dev/null) || issues_created=""
+    summary=$(echo "$triage_result" | jq -r '.summary // ""' 2>/dev/null) || summary=""
+
+    case "$recommendation" in
+        "close")
+            log "Closing feedback issue #$issue_num (fully triaged)"
+            set_triage_phase "$issue_num" "complete"
+
+            local close_comment="## ✅ Triage Complete
+
+This feedback has been broken down into actionable issues:
+$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- No new issues needed" )
+
+**Scope:** $scope
+**Summary:** $summary
+
+Closing this feedback issue as the work is now tracked in the child issues above.
+
+---
+<sub>🤖 Automated by auto-dev triage</sub>"
+
+            gh issue comment "$issue_num" --body "$close_comment" >/dev/null 2>&1 || true
+            gh issue close "$issue_num" >/dev/null 2>&1 || true
+            success "Feedback #$issue_num triaged and closed"
+            ;;
+
+        "convert_to_epic")
+            log "Converting feedback #$issue_num to Epic"
+            set_triage_phase "$issue_num" "complete"
+
+            # Get current title and prepend "Epic: " if not already there
+            local current_title
+            current_title=$(gh issue view "$issue_num" --json title -q '.title' 2>/dev/null) || current_title=""
+            if [[ ! "$current_title" =~ ^Epic: ]]; then
+                gh issue edit "$issue_num" --title "Epic: $current_title" >/dev/null 2>&1 || true
+            fi
+
+            local epic_comment="## 📋 Converted to Epic
+
+This feedback has been analyzed and broken down:
+$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- Child issues pending" )
+
+**Scope:** $scope (epic-level)
+**Summary:** $summary
+
+This issue will remain open as a tracking epic for the child issues.
+
+---
+<sub>🤖 Automated by auto-dev triage</sub>"
+
+            gh issue comment "$issue_num" --body "$epic_comment" >/dev/null 2>&1 || true
+            success "Feedback #$issue_num converted to Epic"
+            ;;
+
+        "needs_clarification")
+            log "Feedback #$issue_num needs clarification from user"
+            # Remove triage labels - will be re-triaged when user responds
+            set_triage_phase "$issue_num" "pending"
+
+            # Remove user-feedback label temporarily to avoid re-processing
+            # User can re-add it after providing clarification
+            warn "Issue #$issue_num paused - waiting for user clarification"
+            ;;
+
+        *)
+            warn "Unknown triage recommendation: $recommendation"
+            set_triage_phase "$issue_num" "blocked"
+            ;;
+    esac
+}
+
+# Run the triage session for all untriaged feedback
+run_triage_session() {
+    header "SESSION 0: User Feedback Triage"
+
+    local feedback_issues
+    feedback_issues=$(find_untriaged_feedback_issues)
+
+    if [ -z "$feedback_issues" ]; then
+        log "No user-feedback issues to triage"
+        return 0
+    fi
+
+    local count
+    count=$(echo "$feedback_issues" | wc -l | tr -d ' ')
+    log "Found $count user-feedback issue(s) to triage"
+
+    # Process each feedback issue
+    while IFS='|' read -r issue_num issue_title; do
+        [ -z "$issue_num" ] && continue
+
+        log "Processing feedback: #$issue_num - $issue_title"
+
+        local triage_result
+        if triage_result=$(triage_feedback_issue "$issue_num"); then
+            complete_triage "$issue_num" "$triage_result"
+        else
+            warn "Triage failed for issue #$issue_num"
+        fi
+
+        # Brief pause between issues
+        sleep 2
+    done <<< "$feedback_issues"
+
+    success "Triage session complete"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -730,13 +1129,14 @@ $hint_section
 2. SKIP these issues (in-progress or have open PRs): $skip_issues
 3. SKIP issues with any 'auto-dev:' labels (they are being worked on)
 4. SKIP issues titled 'Epic:' (they are parent tracking issues)
-5. From remaining issues, prioritize by labels:
+5. SKIP issues labeled 'user-feedback' (they require triage first)
+6. From remaining issues, prioritize by labels:
    - P0-foundation (highest priority - do these first)
    - P1-core (high priority)
    - P2-enhancement (medium priority)
    - P3-future (lower priority)
    - bugs > features > enhancements
-6. Select ONE issue to work on - prefer smaller, well-defined issues
+7. Select ONE issue to work on - prefer smaller, well-defined issues
 
 IMPORTANT: There are many valid issues to choose from. Pick the highest priority one that is actionable.
 Do NOT return null unless there are literally zero open issues after filtering.
@@ -881,21 +1281,8 @@ is_pr_merged() {
     return 1
 }
 
-#─────────────────────────────────────────────────────────────────────
-# Check if code review was already approved
-#─────────────────────────────────────────────────────────────────────
-has_review_approved() {
-    local issue_num=$1
-
-    # Check issue comments for an approved review session
-    local comments
-    comments=$(gh issue view "$issue_num" --comments --json comments -q '.comments[].body' 2>/dev/null || echo "")
-
-    if echo "$comments" | grep -qi "Code Review.*APPROVED"; then
-        return 0
-    fi
-    return 1
-}
+# NOTE: Review approval is now signaled via labels (auto-dev:signal:review-approved)
+# Use has_signal() to check for review approval
 
 #─────────────────────────────────────────────────────────────────────
 # Check if documentation was already updated for this issue
@@ -1038,6 +1425,14 @@ The output MUST follow this EXACT structure:
     local session_end
     session_end=$(date +%s)
 
+    # Ensure plan has markers (Claude sometimes forgets them)
+    if ! echo "$plan" | grep -q "AUTODEV-PLAN-START"; then
+        log "Adding missing plan markers..."
+        plan="<!-- AUTODEV-PLAN-START -->
+$plan
+<!-- AUTODEV-PLAN-END -->"
+    fi
+
     # Post plan as comment on the GitHub issue (this is the only storage)
     log "Posting plan to GitHub issue #$issue_num..."
     gh issue comment "$issue_num" --body "$plan" >/dev/null 2>&1 || warn "Failed to post plan to GitHub"
@@ -1079,7 +1474,8 @@ implement_and_test() {
     if [ "$current_branch" != "main" ]; then
         log "Currently on branch '$current_branch', switching to main..."
         # Stash any uncommitted changes (shouldn't happen, but safety first)
-        git stash --include-untracked 2>/dev/null || true
+        # Suppress all output to avoid polluting function return value
+        git stash --include-untracked >/dev/null 2>&1 || true
         git checkout main 2>&1 | head -5 >&2 || true
     fi
 
@@ -1290,6 +1686,13 @@ Example: PR_CREATED: 123
         return 1
     fi
 
+    # Validate PR number before storing (defensive against any stdout pollution)
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number extracted. Check if PR was created correctly."
+        return 1
+    fi
+
     # Store PR metadata
     set_metadata "$issue_num" "pr" "$pr_num"
     set_metadata "$issue_num" "branch" "$current_branch"
@@ -1312,6 +1715,14 @@ Example: PR_CREATED: 123
 #─────────────────────────────────────────────────────────────────────
 wait_for_ci() {
     local pr_num=$1
+
+    # Validate PR number to catch data corruption early
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to wait_for_ci"
+        return 1
+    fi
+
     local max_wait_minutes=15  # Maximum time to wait for CI
     local poll_interval=30     # Seconds between polls
     local max_polls=$((max_wait_minutes * 60 / poll_interval))
@@ -1389,6 +1800,13 @@ fix_ci_failures() {
     local pr_num=$1
     local issue_num=$2
     local attempt=$3
+
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to fix_ci_failures"
+        return 1
+    fi
 
     header "SESSION: Fixing CI Failures (Attempt $attempt/$MAX_CI_FIX_ATTEMPTS)"
     set_phase "$issue_num" "ci-failed"
@@ -1487,6 +1905,14 @@ Output 'CI_FIXES_PUSHED' when fixes are committed and pushed.
 run_ci_fix_loop() {
     local pr_num=$1
     local issue_num=$2
+
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to run_ci_fix_loop"
+        return 1
+    fi
+
     local attempt=0
 
     while [ $attempt -lt $MAX_CI_FIX_ATTEMPTS ]; do
@@ -1524,10 +1950,17 @@ review_code() {
     local pr_num=$1
     local issue_num=$2
 
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to review_code"
+        return 1
+    fi
+
     header "SESSION 4: Code Review (Fresh Context)"
 
     # Check if review was already approved (idempotency)
-    if has_review_approved "$issue_num"; then
+    if has_signal "$issue_num" "review-approved"; then
         log "Code review already approved for issue #$issue_num"
         success "Skipping review - already approved"
         return 0
@@ -1542,6 +1975,10 @@ review_code() {
 
     set_phase "$issue_num" "reviewing"
     log "Reviewing PR #$pr_num with fresh eyes..."
+
+    # Clear any existing review signals before starting fresh review
+    clear_signal "$issue_num" "review-approved"
+    clear_signal "$issue_num" "review-changes"
 
     local session_start
     session_start=$(date +%s)
@@ -1581,8 +2018,7 @@ $review_history
 "
     fi
 
-    local raw_output
-    raw_output=$(run_claude "
+    run_claude "
 You are a senior code reviewer examining PR #$pr_num (Review Round $next_round).
 
 **CRITICAL**: You did NOT write this code. Review it with fresh eyes.
@@ -1640,95 +2076,67 @@ $pr_diff
    - N+1 queries?
    - Unnecessary re-renders (React)?
 
-## Output Format
-
-Provide your review as a JSON object ONLY (no markdown, no explanation):
-
-{
-  \"status\": \"approved\" | \"changes_requested\",
-  \"comments\": [
-    {
-      \"file\": \"path/to/file.ts\",
-      \"line\": 42,
-      \"severity\": \"error\" | \"warning\" | \"suggestion\",
-      \"issue\": \"Clear description of the problem\",
-      \"suggestion\": \"How to fix it\"
-    }
-  ],
-  \"testing\": {
-    \"unit_tests_added\": true | false,
-    \"e2e_tests_added\": true | false,
-    \"missing_tests\": [\"description of missing test coverage\"],
-    \"test_quality\": \"adequate\" | \"insufficient\" | \"excellent\"
-  },
-  \"summary\": \"Brief 1-2 sentence overall assessment\"
-}
-
-Be thorough but fair. Only request changes for real issues, not style preferences.
+## REQUIRED ACTIONS (do these in order)
 
 $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 
-**IMPORTANT:** Create any discovered issues BEFORE outputting the JSON review result.
-")
+### Step 1: Create any discovered issues FIRST
+If you find issues worth tracking separately, create GitHub issues for them before proceeding.
+
+### Step 2: Post your review as a GitHub issue comment
+Post a detailed review comment to issue #$issue_num using:
+
+gh issue comment $issue_num --body '## 🔍 Code Review Round $next_round
+
+**Status:** APPROVED or CHANGES_REQUESTED
+**Summary:** Your 1-2 sentence assessment
+
+### Review Comments
+- **[severity]** \`file:line\` - Issue description
+  - 💡 Suggestion
+
+### Testing Assessment
+- Unit tests: adequate/insufficient/excellent
+- E2E tests: adequate/insufficient/excellent
+- Missing coverage: list any gaps
+
+---
+<sub>🤖 Auto-Dev Code Review</sub>'
+
+### Step 3: Set the appropriate signal label
+This is CRITICAL - the automation reads this label to determine next steps.
+
+**If APPROVED** (no blocking issues):
+\`\`\`bash
+gh issue edit $issue_num --add-label 'auto-dev:signal:review-approved'
+\`\`\`
+
+**If CHANGES REQUESTED** (has blocking issues):
+\`\`\`bash
+gh issue edit $issue_num --add-label 'auto-dev:signal:review-changes'
+\`\`\`
+
+Be thorough but fair. Only request changes for real issues, not style preferences.
+" > /dev/null  # Output discarded - status determined by label
 
     local session_end
     session_end=$(date +%s)
 
-    # Extract JSON from output (Claude may include explanatory text)
-    local extracted_json
-    extracted_json=$(echo "$raw_output" | grep -E '^\{.*\}$' | tail -1) || true
-    if [ -z "$extracted_json" ]; then
-        # Try to find JSON object with status field
-        extracted_json=$(echo "$raw_output" | tr '\n' ' ' | grep -oE '\{[^{}]*"status"[^{}]*\}' | tail -1) || true
-    fi
+    # Post session memory
+    post_session_memory "$issue_num" "Code Review" "$session_start" "$session_end" "${SESSION_COST:-0}" \
+        "Reviewed PR #$pr_num (round $next_round)"
 
-    if [ -z "$extracted_json" ]; then
-        error "Failed to extract JSON from review output"
-        echo "$raw_output" >&2
-        return 1
-    fi
-
-    local review_status review_summary
-    review_status=$(echo "$extracted_json" | jq -r '.status // "changes_requested"' 2>/dev/null) || review_status="changes_requested"
-    review_summary=$(echo "$extracted_json" | jq -r '.summary // "Review completed"' 2>/dev/null) || review_summary="Review completed"
-
-    log "Review Summary: $review_summary"
-
-    # Get current review round
-    local review_round
-    review_round=$(get_metadata "$issue_num" "round")
-    review_round=${review_round:-1}
-
-    # Post session memory (use tr for uppercase - bash 3.x compatible)
-    local review_status_upper
-    review_status_upper=$(printf '%s' "$review_status" | tr '[:lower:]' '[:upper:]')
-
-    # Format review comments for GitHub
-    local formatted_comments=""
-    formatted_comments=$(echo "$extracted_json" | jq -r '.comments[]? | "- **[\(.severity)]** `\(.file):\(.line)` - \(.issue)\n  - 💡 \(.suggestion // "No suggestion")"' 2>/dev/null) || formatted_comments=""
-
-    # Post FULL review result to GitHub issue (this is the persistent memory!)
-    local review_body="## 🔍 Code Review Round $review_round
-
-**Status:** ${review_status_upper}
-**Summary:** $review_summary
-
-### Review Comments
-$formatted_comments
-
----
-<sub>🤖 Auto-Dev Code Review | Session cost: \$${SESSION_COST:-0}</sub>"
-
-    gh issue comment "$issue_num" --body "$review_body" >/dev/null 2>&1 || warn "Failed to post review to GitHub"
-
-    if [ "$review_status" = "approved" ]; then
+    # Check which signal label was set
+    if has_signal "$issue_num" "review-approved"; then
         success "Code review: APPROVED"
         return 0
-    else
+    elif has_signal "$issue_num" "review-changes"; then
         warn "Code review: CHANGES REQUESTED"
-        echo ""
-        echo "$extracted_json" | jq -r '.comments[]? | "  [\(.severity)] \(.file):\(.line) - \(.issue)"' 2>/dev/null || true
-        echo ""
+        return 1
+    else
+        # No signal label set - treat as error, default to changes requested
+        error "Review session did not set a signal label - defaulting to changes requested"
+        set_signal "$issue_num" "review-changes"
         return 1
     fi
 }
@@ -1741,9 +2149,20 @@ fix_review_feedback() {
     local pr_num=$1
     local issue_num=$2
 
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to fix_review_feedback"
+        return 1
+    fi
+
     header "SESSION 5: Fixing Review Feedback"
     set_phase "$issue_num" "fixing"
     log "Addressing review comments for PR #$pr_num..."
+
+    # Clear review signal labels - next review will set fresh ones
+    clear_signal "$issue_num" "review-approved"
+    clear_signal "$issue_num" "review-changes"
 
     local session_start
     session_start=$(date +%s)
@@ -1837,6 +2256,13 @@ Output 'FIXES_COMPLETE' when all fixes are complete and pushed.
 merge_and_verify() {
     local pr_num=$1
     local issue_num=$2
+
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to merge_and_verify"
+        return 1
+    fi
 
     header "SESSION 6: Merge + Deploy + Verify"
 
@@ -1938,6 +2364,8 @@ Output 'DEPLOYMENT_VERIFIED' when verification is complete, or 'DEPLOYMENT_FAILE
 # Context: Clean - focused on doc updates
 # Phase: 9 from CLAUDE.md
 #─────────────────────────────────────────────────────────────────────
+# Update documentation on feature branch BEFORE merge
+# Returns 0 if no changes, 1 if docs were updated (caller should re-run CI)
 update_documentation() {
     local issue_num=$1
 
@@ -1950,14 +2378,21 @@ update_documentation() {
         return 0
     fi
 
-    log "Checking if documentation updates are needed..."
+    # Stay on current branch (feature branch) - docs go into the PR
+    local current_branch
+    current_branch=$(git branch --show-current 2>/dev/null || echo "")
+    log "Checking documentation on branch: $current_branch"
+
+    # Clear any existing needs-update signal
+    clear_signal "$issue_num" "needs-update"
 
     local session_start
     session_start=$(date +%s)
 
-    local raw_output
-    raw_output=$(run_claude "
-Analyze if documentation updates are needed after implementing issue #$issue_num.
+    run_claude "
+Analyze if documentation updates are needed for issue #$issue_num.
+
+You are on the feature branch. Any doc updates will be part of the PR.
 
 Check if CLAUDE.md should be updated for:
 - New patterns or conventions introduced
@@ -1969,32 +2404,31 @@ Check if CLAUDE.md should be updated for:
 
 Be conservative - only suggest updates for significant changes.
 
-Output JSON ONLY (no markdown):
-{\"needs_update\": true|false, \"reason\": \"Brief explanation\"}
-")
+## REQUIRED ACTION
+
+If documentation DOES need updating, add a signal label:
+\`\`\`bash
+gh issue edit $issue_num --add-label 'auto-dev:signal:needs-update'
+\`\`\`
+
+If documentation does NOT need updating, do nothing (no label needed).
+
+Post a brief comment explaining your decision:
+\`\`\`bash
+gh issue comment $issue_num --body '## 📚 Documentation Check
+
+**Needs update:** YES/NO
+**Reason:** Brief explanation'
+\`\`\`
+" > /dev/null
 
     local session_end
     session_end=$(date +%s)
 
-    # Extract JSON from output (Claude may include explanatory text)
-    local extracted_json
-    extracted_json=$(echo "$raw_output" | grep -E '^\{.*\}$' | head -1) || true
-    if [ -z "$extracted_json" ]; then
-        extracted_json=$(echo "$raw_output" | tr '\n' ' ' | grep -oE '\{[^{}]*"needs_update"[^{}]*\}' | head -1) || true
-    fi
-
-    if [ -z "$extracted_json" ]; then
-        warn "Could not determine if docs need update"
-        return 0
-    fi
-
-    local needs_update
-    needs_update=$(echo "$extracted_json" | jq -r '.needs_update')
-
-    if [ "$needs_update" = "true" ]; then
-        local reason
-        reason=$(echo "$extracted_json" | jq -r '.reason')
-        log "Documentation update needed: $reason"
+    # Check if documentation update is needed via signal label
+    if has_signal "$issue_num" "needs-update"; then
+        log "Documentation update needed"
+        clear_signal "$issue_num" "needs-update"
 
         local doc_session_start
         doc_session_start=$(date +%s)
@@ -2002,7 +2436,10 @@ Output JSON ONLY (no markdown):
         run_claude "
 Update CLAUDE.md based on changes from issue #$issue_num.
 
-**Reason for update:** $reason
+You are on the feature branch. Doc changes will be part of the PR.
+
+Check the previous comment on the issue for the reason documentation needs updating:
+  gh issue view $issue_num --comments --json comments -q '.comments[-1].body'
 
 Guidelines:
 - Keep updates minimal and focused
@@ -2016,18 +2453,24 @@ After updating:
 3. git push
 
 Output 'DOCS_UPDATED' when complete.
-" > /dev/null  # Discard stdout - no output capture needed
+" > /dev/null
 
         local doc_session_end
         doc_session_end=$(date +%s)
 
         post_session_memory "$issue_num" "Documentation" "$doc_session_start" "$doc_session_end" "${SESSION_COST:-0}" \
-            "Updated CLAUDE.md: $reason"
+            "Updated CLAUDE.md based on issue changes"
 
-        success "Documentation updated"
+        success "Documentation updated - CI will re-run"
+        return 1  # Signal that docs were updated, caller should wait for CI
     else
         success "No documentation updates needed"
+        return 0
     fi
+
+    # Post session memory for the check
+    post_session_memory "$issue_num" "Documentation Check" "$session_start" "$session_end" "${SESSION_COST:-0}" \
+        "Checked if documentation updates needed"
 }
 
 #─────────────────────────────────────────────────────────────────────
@@ -2080,9 +2523,10 @@ resume_from_phase() {
     issue_title=$(echo "$issue_json" | jq -r '.title // "Unknown"' 2>/dev/null) || issue_title="Unknown"
     issue_body=$(echo "$issue_json" | jq -r '.body // ""' 2>/dev/null) || issue_body=""
 
-    # Get PR number if exists
+    # Get PR number if exists (validate to catch any corruption)
     local pr_num
     pr_num=$(get_metadata "$issue_num" "pr")
+    pr_num=$(validate_pr_number "$pr_num")
 
     case "$phase" in
         "selecting")
@@ -2094,6 +2538,11 @@ resume_from_phase() {
             # Run implementation
             local new_pr
             if new_pr=$(implement_and_test "$issue_num"); then
+                new_pr=$(validate_pr_number "$new_pr")
+                if [ -z "$new_pr" ]; then
+                    mark_blocked "$issue_num" "Invalid PR number returned from implementation"
+                    return 1
+                fi
                 pr_num="$new_pr"
                 resume_from_phase "$issue_num" "pr-waiting"
             else
@@ -2104,6 +2553,11 @@ resume_from_phase() {
             # Continue/retry implementation
             local new_pr
             if new_pr=$(implement_and_test "$issue_num"); then
+                new_pr=$(validate_pr_number "$new_pr")
+                if [ -z "$new_pr" ]; then
+                    mark_blocked "$issue_num" "Invalid PR number returned from implementation"
+                    return 1
+                fi
                 pr_num="$new_pr"
                 resume_from_phase "$issue_num" "pr-waiting"
             else
@@ -2163,12 +2617,12 @@ resume_from_phase() {
                 mark_blocked "$issue_num" "No PR number found"
                 return 1
             fi
+            # Docs should already be done before merging phase
             merge_and_verify "$pr_num" "$issue_num"
-            update_documentation "$issue_num"
             complete_issue "$issue_num" "$pr_num"
             ;;
         "verifying")
-            update_documentation "$issue_num"
+            # PR already merged, just complete
             complete_issue "$issue_num" "$pr_num"
             ;;
         "complete")
@@ -2187,6 +2641,13 @@ resume_from_phase() {
 run_review_loop() {
     local issue_num=$1
     local pr_num=$2
+
+    # Validate PR number
+    pr_num=$(validate_pr_number "$pr_num")
+    if [ -z "$pr_num" ]; then
+        error "Invalid PR number passed to run_review_loop"
+        return 1
+    fi
 
     # Get current review round
     local review_round
@@ -2207,9 +2668,16 @@ run_review_loop() {
         log "Review round $review_round/$MAX_REVIEW_ROUNDS"
 
         if review_code "$pr_num" "$issue_num"; then
-            # Approved - continue to merge
+            # Approved - check docs before merge
+            if ! update_documentation "$issue_num"; then
+                # Docs were updated, wait for CI before merging
+                log "Documentation updated, waiting for CI..."
+                if ! run_ci_fix_loop "$pr_num" "$issue_num"; then
+                    mark_blocked "$issue_num" "CI failed after doc update"
+                    return 1
+                fi
+            fi
             merge_and_verify "$pr_num" "$issue_num"
-            update_documentation "$issue_num"
             complete_issue "$issue_num" "$pr_num"
             return 0
         fi
@@ -2254,6 +2722,14 @@ main() {
         exit 0
     fi
 
+    # Handle --triage flag (triage-only mode)
+    if [ "$RUN_TRIAGE_ONLY" = true ]; then
+        log "Triage-only mode - will triage feedback and exit"
+        run_triage_session
+        success "Triage-only mode complete"
+        exit 0
+    fi
+
     if [ -n "$TARGET_ISSUE" ]; then
         log "Target issue mode - working on issue #$TARGET_ISSUE"
     elif [ "$SINGLE_CYCLE" = true ]; then
@@ -2273,6 +2749,12 @@ main() {
         log "═══════════════════════════════════════════════════════════"
         log "Starting development cycle at $(date)"
         log "═══════════════════════════════════════════════════════════"
+
+        # Session 0: Triage ALL user-feedback issues first
+        # Always runs before any dev work (unless targeting a specific issue or resume-only)
+        if [ -z "$TARGET_ISSUE" ] && [ "$RESUME_ONLY" != true ]; then
+            run_triage_session
+        fi
 
         local issue_num="" issue_title="" issue_body=""
 
@@ -2365,6 +2847,13 @@ main() {
         local pr_num=""
         if ! pr_num=$(implement_and_test "$issue_num"); then
             mark_blocked "$issue_num" "Implementation failed"
+            continue
+        fi
+
+        # Validate PR number to catch any stdout pollution
+        pr_num=$(validate_pr_number "$pr_num")
+        if [ -z "$pr_num" ]; then
+            mark_blocked "$issue_num" "Invalid PR number returned from implementation"
             continue
         fi
 

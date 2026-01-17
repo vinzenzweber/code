@@ -7,12 +7,13 @@ Automated development loop that orchestrates multiple Claude Code sessions to ha
 `./code.sh` fetches GitHub issues, plans implementations, writes code, runs tests, reviews changes, and deploys—all with minimal human intervention.
 
 ```bash
-./code.sh                      # Run continuous loop
-./code.sh --once               # Run single cycle
+./code.sh                      # Run continuous loop (triage → select → dev)
+./code.sh --once               # Run single cycle including triage
 ./code.sh -i 42                # Work on specific issue (implies --once)
 ./code.sh --issue 42           # Same as above
 ./code.sh --resume             # Resume in-progress work only
-./code.sh --status             # Show status of in-progress issues
+./code.sh --status             # Show triage and dev status
+./code.sh --triage             # Triage-only mode, then exit
 ./code.sh --hint "..."         # Provide priority hint for issue selection
 ./code.sh --init               # Initial setup (GitHub labels) - run once per repo
 ```
@@ -29,6 +30,7 @@ Guide issue prioritization with natural language:
 
 ## Features
 
+- **User Feedback Triage** — Automatically breaks down `user-feedback` labeled issues into atomic dev tasks
 - **GitHub-based Memory** — All state stored in labels and comments
 - **Crash Recovery** — Resume from any phase after interruption
 - **Multi-machine Support** — Start on laptop, continue on desktop
@@ -43,11 +45,27 @@ The workflow separates work into distinct Claude Code sessions with intentional 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
+│  SESSION 0: User Feedback Triage (runs first, every cycle)      │
+│  Context: Clean                                                 │
+│  • Loop through ALL issues labeled 'user-feedback'              │
+│  • For each: analyze scope, create atomic child issues          │
+│  • Close parent or convert to Epic                              │
+│  • Only proceeds after ALL feedback is triaged                  │
+│  → Labels: auto-dev:triage:pending → analyzing → complete       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              (if --triage flag, exit here)
+                              │
+            (only after ALL feedback processed)
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
 │  SESSION 1: Issue Selection                                     │
 │  Context: Clean                                                 │
 │  • Fetch open GitHub issues                                     │
+│  • Skip issues labeled 'user-feedback' (require triage)         │
+│  • Pick from atomic issues created by triage                    │
 │  • Analyze priority, complexity, dependencies                   │
-│  • Select best issue to work on                                 │
 │  → Labels: auto-dev:selecting                                   │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -86,7 +104,9 @@ The workflow separates work into distinct Claude Code sessions with intentional 
 │  • Fresh eyes review                                            │
 │  • No implementation bias                                       │
 │  • Security, correctness, testing, KISS checks                  │
+│  • Sets signal label for status                                 │
 │  → Labels: auto-dev:reviewing                                   │
+│  → Signals: auto-dev:signal:review-approved or review-changes   │
 │  → Metadata: auto-dev:round:<n>                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -94,14 +114,15 @@ The workflow separates work into distinct Claude Code sessions with intentional 
                     ▼                   ▼
           [Changes Requested]      [Approved]
                     │                   │
-                    ▼                   │
-┌───────────────────────────────┐       │
-│  SESSION 5: Fix Feedback      │       │
-│  → Labels: auto-dev:fixing    │       │
-│  • Address review comments    │       │
-│  • Push fixes                 │       │
-│  • Loop back to CI            │       │
-└───────────────────────────────┘       │
+                    ▼                   ▼
+┌───────────────────────────────┐ ┌─────────────────────────────────┐
+│  SESSION 5: Fix Feedback      │ │  SESSION 7: Documentation       │
+│  → Labels: auto-dev:fixing    │ │  Context: Clean                 │
+│  • Address review comments    │ │  • Check if CLAUDE.md needs     │
+│  • Push fixes                 │ │    updates (on feature branch)  │
+│  • Loop back to CI            │ │  • If updated, wait for CI      │
+└───────────────────────────────┘ └─────────────────────────────────┘
+                                        │
                                         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  SESSION 6: Merge + Deploy + Verify                             │
@@ -109,16 +130,7 @@ The workflow separates work into distinct Claude Code sessions with intentional 
 │  • Merge PR (squash)                                            │
 │  • Wait for Railway deployment                                  │
 │  • Verify in production via Playwright MCP                      │
-│  → Labels: auto-dev:merging → auto-dev:verifying                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SESSION 7: Documentation (optional)                            │
-│  Context: Clean                                                 │
-│  • Check if CLAUDE.md needs updates                             │
-│  • Update docs if significant changes                           │
-│  → Labels: auto-dev:complete                                    │
+│  → Labels: auto-dev:merging → auto-dev:verifying → complete     │
 │  → Metadata: auto-dev:cost:<total>                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -126,6 +138,17 @@ The workflow separates work into distinct Claude Code sessions with intentional 
 ## GitHub Memory System
 
 All workflow state is stored in GitHub, enabling crash recovery and multi-machine support.
+
+### Triage Labels
+
+User feedback issues are processed through triage before development:
+
+| Label | Description |
+|-------|-------------|
+| `auto-dev:triage:pending` | Feedback awaiting triage |
+| `auto-dev:triage:analyzing` | Being analyzed for scope |
+| `auto-dev:triage:complete` | Triage complete, child issues created |
+| `auto-dev:triage:blocked` | Triage needs manual intervention |
 
 ### Phase Labels
 
@@ -153,6 +176,16 @@ Issues are tagged with exactly one phase label at any time:
 | `auto-dev:branch:<name>` | `auto-dev:branch:feat/issue-47` | Branch name |
 | `auto-dev:round:<n>` | `auto-dev:round:2` | Current review round |
 | `auto-dev:cost:<amount>` | `auto-dev:cost:1.23` | Total accumulated cost |
+
+### Signal Labels
+
+Signal labels are used by Claude sessions to communicate completion status. They are consumed (removed) after being read by the script.
+
+| Label | Description |
+|-------|-------------|
+| `auto-dev:signal:review-approved` | Review passed, ready to proceed |
+| `auto-dev:signal:review-changes` | Review requests changes |
+| `auto-dev:signal:needs-update` | Documentation needs updating |
 
 ### Session Comments
 
@@ -263,7 +296,7 @@ Sessions 1, 2, 4, 5, and 7 use **clean context** for objectivity:
 - **Planning**: Fresh codebase exploration without selection bias
 - **Code Review**: No "I know what I meant" bias—reviews actual code objectively
 - **Fix Feedback**: Address specific comments without defensive context
-- **Documentation**: Focused on docs, not implementation details
+- **Documentation**: Runs on feature branch before merge, changes go through CI
 
 ### The Code Review Insight
 
@@ -352,10 +385,10 @@ Edit `./code.sh` to modify:
 
 - **Issue selection criteria** — Edit `select_issue()` prompt
 - **Review strictness** — Edit `review_code()` checklist
-- **Skip documentation phase** — Comment out `update_documentation` call
 - **Wait times** — Modify `sleep` values
 - **Max review rounds** — Change `MAX_REVIEW_ROUNDS`
 - **Add custom phases** — Create new functions and update `resume_from_phase()`
+- **Signal labels** — Add new signals in `SIGNAL_LABELS` array
 
 ## Portable Usage
 
