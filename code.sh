@@ -650,6 +650,18 @@ Analyze this feedback and determine:
 ## Actions Based on Analysis
 
 ### If feedback is CLEAR and ACTIONABLE:
+
+**IMPORTANT: Check for duplicates FIRST!**
+Before creating any issue, search for existing issues that might already cover the same work:
+\`\`\`bash
+gh issue list --state open --json number,title --limit 100
+\`\`\`
+
+For each issue you would create:
+1. Check if a similar issue already exists (same feature/fix, even if worded differently)
+2. If duplicate exists: Skip creation, note the existing issue number
+3. If no duplicate: Create the new issue
+
 Create atomic child issues using:
 \`\`\`bash
 gh issue create --title \"Title here\" --body \"Body here\" --label \"priority-label\"
@@ -660,6 +672,7 @@ Each child issue should:
 - Have a clear title starting with a verb (Add, Fix, Update, Implement, etc.)
 - Reference the parent: 'Part of #$issue_num'
 - Have appropriate priority label (P0-foundation, P1-core, P2-enhancement, P3-future)
+- NOT duplicate an existing open issue
 
 ### If feedback NEEDS CLARIFICATION:
 Add a comment asking for specifics:
@@ -673,12 +686,15 @@ After your analysis and actions, output ONLY this JSON (no markdown, no explanat
 {
     \"scope\": \"small|medium|epic|unclear\",
     \"issues_created\": [123, 124, 125],
+    \"issues_linked\": [42, 43],
     \"recommendation\": \"close|convert_to_epic|needs_clarification\",
     \"summary\": \"Brief summary of what was done\"
 }
 
 Where:
-- 'close': Feedback fully addressed by child issues, can close parent
+- 'issues_created': New issues you created
+- 'issues_linked': Existing issues that already cover part of this feedback (duplicates you found)
+- 'close': Feedback fully addressed by child issues or existing issues, can close parent
 - 'convert_to_epic': Large scope, rename to 'Epic: ...' and keep open as tracker
 - 'needs_clarification': Asked user for more info, pause triage
 ")
@@ -715,10 +731,11 @@ complete_triage() {
     local issue_num=$1
     local triage_result=$2
 
-    local recommendation scope issues_created summary
+    local recommendation scope issues_created issues_linked summary
     recommendation=$(echo "$triage_result" | jq -r '.recommendation // "close"' 2>/dev/null) || recommendation="close"
     scope=$(echo "$triage_result" | jq -r '.scope // "small"' 2>/dev/null) || scope="small"
     issues_created=$(echo "$triage_result" | jq -r '.issues_created // [] | join(", ")' 2>/dev/null) || issues_created=""
+    issues_linked=$(echo "$triage_result" | jq -r '.issues_linked // [] | join(", ")' 2>/dev/null) || issues_linked=""
     summary=$(echo "$triage_result" | jq -r '.summary // ""' 2>/dev/null) || summary=""
 
     case "$recommendation" in
@@ -729,12 +746,13 @@ complete_triage() {
             local close_comment="## ✅ Triage Complete
 
 This feedback has been broken down into actionable issues:
-$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- No new issues needed" )
+$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- No new issues created" )
+$( [ -n "$issues_linked" ] && echo "- Linked to existing issues: #${issues_linked//,/, #}" || echo "" )
 
 **Scope:** $scope
 **Summary:** $summary
 
-Closing this feedback issue as the work is now tracked in the child issues above.
+Closing this feedback issue as the work is now tracked in the issues above.
 
 ---
 <sub>🤖 Automated by auto-dev triage</sub>"
@@ -758,7 +776,8 @@ Closing this feedback issue as the work is now tracked in the child issues above
             local epic_comment="## 📋 Converted to Epic
 
 This feedback has been analyzed and broken down:
-$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- Child issues pending" )
+$( [ -n "$issues_created" ] && echo "- Created issues: #${issues_created//,/, #}" || echo "- No new issues created" )
+$( [ -n "$issues_linked" ] && echo "- Linked to existing issues: #${issues_linked//,/, #}" || echo "" )
 
 **Scope:** $scope (epic-level)
 **Summary:** $summary
@@ -792,6 +811,10 @@ This issue will remain open as a tracking epic for the child issues.
 # Run the triage session for all untriaged feedback
 run_triage_session() {
     header "SESSION 0: User Feedback Triage"
+
+    # Ensure triage labels exist before we try to use them
+    # (handles case where --init was never run)
+    ensure_labels_exist
 
     local feedback_issues
     feedback_issues=$(find_untriaged_feedback_issues)
