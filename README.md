@@ -88,7 +88,7 @@ The workflow separates work into distinct Claude Code sessions with intentional 
 │  • Manual testing with Playwright MCP                           │
 │  • Create PR                                                    │
 │  → Labels: auto-dev:implementing → auto-dev:pr-waiting          │
-│  → Metadata: auto-dev:pr:<num>, auto-dev:branch:<name>          │
+│  → Metadata: auto-dev:branch:<name>                             │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -172,10 +172,11 @@ Issues are tagged with exactly one phase label at any time:
 
 | Pattern | Example | Description |
 |---------|---------|-------------|
-| `auto-dev:pr:<num>` | `auto-dev:pr:47` | Associated PR number |
 | `auto-dev:branch:<name>` | `auto-dev:branch:feat/issue-47` | Branch name |
 | `auto-dev:round:<n>` | `auto-dev:round:2` | Current review round |
 | `auto-dev:cost:<amount>` | `auto-dev:cost:1.23` | Total accumulated cost |
+
+> **Note:** PR associations are tracked via GitHub's native linked PR feature (using "Closes #issue" in PR descriptions) rather than labels.
 
 ### Signal Labels
 

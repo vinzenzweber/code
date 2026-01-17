@@ -319,7 +319,7 @@ get_phase() {
     echo ""
 }
 
-# Add/update a metadata label (pr number, branch, round, cost)
+# Add/update a metadata label (branch, round, cost)
 set_metadata() {
     local issue_num=$1
     local key=$2
@@ -511,7 +511,7 @@ show_status() {
 
         while IFS='|' read -r num phase title; do
             local pr_num branch cost
-            pr_num=$(get_metadata "$num" "pr")
+            pr_num=$(get_linked_pr "$num" 2>/dev/null) || true
             cost=$(get_accumulated_cost "$num")
 
             printf "%-6s %-15s %-50s\n" "#$num" "$phase" "${title:0:50}"
@@ -1240,23 +1240,43 @@ get_implementation_plan() {
 }
 
 #─────────────────────────────────────────────────────────────────────
+# Get linked PR from GitHub's native cross-reference tracking
+# This queries the timeline API for PRs that reference this issue
+#─────────────────────────────────────────────────────────────────────
+get_linked_pr() {
+    local issue_num="$1"
+
+    # Query GitHub timeline for cross-referenced PRs
+    # Filter for events where another issue/PR references this one
+    local pr_num
+    pr_num=$(gh api "repos/$GITHUB_OWNER/$GITHUB_REPO/issues/$issue_num/timeline" \
+        --jq '[.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null) | .source.issue.number] | first // empty' 2>/dev/null) || true
+
+    if [ -n "$pr_num" ]; then
+        echo "$pr_num"
+        return 0
+    fi
+
+    return 1
+}
+
+#─────────────────────────────────────────────────────────────────────
 # Check if a PR already exists for an issue
 #─────────────────────────────────────────────────────────────────────
 has_pr_for_issue() {
     local issue_num=$1
 
-    # Check metadata label first (fastest)
-    local pr_from_label
-    pr_from_label=$(get_metadata "$issue_num" "pr")
-    if [ -n "$pr_from_label" ]; then
+    # Check for linked PR via GitHub's native cross-reference tracking
+    local linked_pr
+    if linked_pr=$(get_linked_pr "$issue_num"); then
         # Verify the PR still exists
-        if gh pr view "$pr_from_label" --json number >/dev/null 2>&1; then
-            echo "$pr_from_label"
+        if gh pr view "$linked_pr" --json number >/dev/null 2>&1; then
+            echo "$linked_pr"
             return 0
         fi
     fi
 
-    # Search for PRs that mention this issue
+    # Fallback: Search for PRs that mention this issue
     local pr_num
     pr_num=$(gh pr list --search "issue #$issue_num" --json number -q '.[0].number' 2>/dev/null || echo "")
     if [ -n "$pr_num" ]; then
@@ -1458,7 +1478,6 @@ implement_and_test() {
     local existing_pr
     if existing_pr=$(has_pr_for_issue "$issue_num"); then
         log "PR #$existing_pr already exists for issue #$issue_num"
-        set_metadata "$issue_num" "pr" "$existing_pr"
         set_phase "$issue_num" "pr-waiting"
         success "Using existing PR #$existing_pr"
         echo "$existing_pr"
@@ -1693,8 +1712,7 @@ Example: PR_CREATED: 123
         return 1
     fi
 
-    # Store PR metadata
-    set_metadata "$issue_num" "pr" "$pr_num"
+    # Store branch metadata and update phase
     set_metadata "$issue_num" "branch" "$current_branch"
     set_phase "$issue_num" "pr-waiting"
 
@@ -2525,7 +2543,7 @@ resume_from_phase() {
 
     # Get PR number if exists (validate to catch any corruption)
     local pr_num
-    pr_num=$(get_metadata "$issue_num" "pr")
+    pr_num=$(get_linked_pr "$issue_num" 2>/dev/null) || true
     pr_num=$(validate_pr_number "$pr_num")
 
     case "$phase" in
