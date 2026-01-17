@@ -125,6 +125,70 @@ warn() { echo -e "${YELLOW}[$(date +'%H:%M:%S')] ⚠${NC} $*" | tee -a "$LOG_FIL
 error() { echo -e "${RED}[$(date +'%H:%M:%S')] ✗${NC} $*" | tee -a "$LOG_FILE" >&2; }
 header() { echo -e "\n${BOLD}${CYAN}$*${NC}" | tee -a "$LOG_FILE" >&2; }
 
+# Detect rate limit errors by parsing JSON output from Claude Code CLI
+# Returns 0 if rate limit error detected, 1 otherwise
+# Checks for:
+#   - API errors: {"type":"error","error":{"type":"rate_limit_error"|"overloaded_error",...}}
+#   - SDK result errors: {"type":"result","subtype":"error_during_execution","errors":[...]}
+#     where errors array contains rate limit related messages
+#   - Hook denials: {"decision":"deny","reason":"Rate limit exceeded"} (exit code 2)
+detect_rate_limit_error() {
+    local output_file="$1"
+
+    # Parse each JSON line looking for rate limit indicators
+    while IFS= read -r line; do
+        # Skip non-JSON lines
+        [[ "$line" != "{"* ]] && continue
+
+        # Try to parse as JSON, skip if invalid
+        local json_valid
+        json_valid=$(echo "$line" | jq -e . 2>/dev/null) || continue
+
+        # Check for hook denial (decision: deny with rate limit reason)
+        local decision reason
+        decision=$(echo "$line" | jq -r '.decision // empty' 2>/dev/null) || true
+        if [ "$decision" = "deny" ]; then
+            reason=$(echo "$line" | jq -r '.reason // empty' 2>/dev/null) || true
+            if echo "$reason" | grep -qiE "(rate.?limit|too many|exceeded|throttl)"; then
+                echo "[$(date +'%Y-%m-%d %H:%M:%S')] RATE LIMIT DETECTED: Hook denial reason='$reason'" >> "$LOG_FILE"
+                return 0
+            fi
+        fi
+
+        # Check for API-level error (type: "error")
+        local msg_type error_type
+        msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || true
+
+        if [ "$msg_type" = "error" ]; then
+            error_type=$(echo "$line" | jq -r '.error.type // empty' 2>/dev/null) || true
+            case "$error_type" in
+                rate_limit_error|overloaded_error)
+                    echo "[$(date +'%Y-%m-%d %H:%M:%S')] RATE LIMIT DETECTED: API error type=$error_type" >> "$LOG_FILE"
+                    return 0
+                    ;;
+            esac
+        fi
+
+        # Check for SDK result with error subtype
+        if [ "$msg_type" = "result" ]; then
+            local subtype
+            subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null) || true
+
+            if [ "$subtype" = "error_during_execution" ]; then
+                # Check if errors array contains rate limit messages
+                local errors
+                errors=$(echo "$line" | jq -r '.errors // [] | .[]' 2>/dev/null) || true
+                if echo "$errors" | grep -qiE "(rate.?limit|429|overloaded|too many requests)"; then
+                    echo "[$(date +'%Y-%m-%d %H:%M:%S')] RATE LIMIT DETECTED: SDK error_during_execution with rate limit message" >> "$LOG_FILE"
+                    return 0
+                fi
+            fi
+        fi
+    done < "$output_file"
+
+    return 1
+}
+
 # Initialize state directory
 mkdir -p "$STATE_DIR"
 
@@ -1049,36 +1113,80 @@ format_progress() {
 # Always runs with --dangerously-skip-permissions and --model opus
 # Uses streaming JSON output for progress display
 # Logs all raw JSON output to LOG_FILE for debugging
+# Handles rate limits and session limits with automatic retry
 run_claude() {
     local prompt_preview
     prompt_preview=$(printf '%s' "$1" | head -c 100 | tr '\n' ' ') 2>/dev/null
 
-    # Track session start
-    SESSION_START_TIME=$(date +%s)
-    SESSION_COST="0"
+    local max_retries=50  # Max retries for rate limits (can wait up to ~8 hours)
+    local retry_count=0
+    local base_wait=300   # Start with 5 minutes wait
+    local max_wait=900    # Max 15 minutes between retries
 
-    # Log session start
-    echo "" >> "$LOG_FILE"
-    echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION START" >> "$LOG_FILE"
-    echo "Prompt: ${prompt_preview}..." >> "$LOG_FILE"
-    echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
+    while true; do
+        # Track session start
+        SESSION_START_TIME=$(date +%s)
+        SESSION_COST="0"
 
-    # Show hint about pause functionality
-    printf "${BLUE}  [Press ESC to pause]${NC}\n" >&2
+        # Log session start
+        echo "" >> "$LOG_FILE"
+        echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION START (attempt $((retry_count + 1)))" >> "$LOG_FILE"
+        echo "Prompt: ${prompt_preview}..." >> "$LOG_FILE"
+        echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
 
-    # All sessions use print mode with streaming JSON for progress display
-    claude --dangerously-skip-permissions --model opus --verbose -p --output-format stream-json "$@" 2>&1 | tee -a "$LOG_FILE" | format_progress
+        # Show hint about pause functionality
+        printf "${BLUE}  [Press ESC to pause]${NC}\n" >&2
 
-    local exit_code=${PIPESTATUS[0]}
+        # Capture output to check for rate limits
+        local output_file
+        output_file=$(mktemp)
 
-    # Log session end
-    echo "" >> "$LOG_FILE"
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION END (exit code: $exit_code, cost: \$${SESSION_COST:-0})" >> "$LOG_FILE"
-    echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
-    echo "" >> "$LOG_FILE"
+        # All sessions use print mode with streaming JSON for progress display
+        claude --dangerously-skip-permissions --model opus --verbose -p --output-format stream-json "$@" 2>&1 | tee -a "$LOG_FILE" | tee "$output_file" | format_progress
 
-    return $exit_code
+        local exit_code=${PIPESTATUS[0]}
+
+        # Log session end
+        echo "" >> "$LOG_FILE"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION END (exit code: $exit_code, cost: \$${SESSION_COST:-0})" >> "$LOG_FILE"
+        echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
+        echo "" >> "$LOG_FILE"
+
+        # Check for rate limit / session limit errors (only if session failed)
+        # Uses JSON parsing to detect actual API errors, not text patterns in Claude's responses
+        if [ $exit_code -ne 0 ] && detect_rate_limit_error "$output_file"; then
+            retry_count=$((retry_count + 1))
+            rm -f "$output_file"
+
+            if [ $retry_count -ge $max_retries ]; then
+                error "Max retries ($max_retries) exceeded for rate limits"
+                return 1
+            fi
+
+            # Calculate wait time with exponential backoff (capped)
+            local wait_time=$((base_wait + (retry_count - 1) * 60))
+            [ $wait_time -gt $max_wait ] && wait_time=$max_wait
+
+            local wait_mins=$((wait_time / 60))
+            warn "Rate/session limit hit. Waiting ${wait_mins} minutes before retry ($retry_count/$max_retries)..."
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] RATE LIMIT: Waiting ${wait_time}s before retry $retry_count" >> "$LOG_FILE"
+
+            # Show countdown
+            local remaining=$wait_time
+            while [ $remaining -gt 0 ]; do
+                printf "\r${YELLOW}  ⏳ Waiting for rate limit: %02d:%02d remaining${NC}  " $((remaining / 60)) $((remaining % 60)) >&2
+                sleep 10
+                remaining=$((remaining - 10))
+            done
+            printf "\r${GREEN}  ✓ Resuming after rate limit wait${NC}                    \n" >&2
+
+            continue  # Retry the claude call
+        fi
+
+        rm -f "$output_file"
+        return $exit_code
+    done
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
