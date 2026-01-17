@@ -1033,19 +1033,23 @@ run_claude() {
 # Common instruction block for discovering and creating new issues
 # Include this in prompts where Claude is actively working with codebase
 NEW_ISSUE_INSTRUCTIONS='
-## Discovering New Issues
+## Discovering and Reporting Issues
 
-While working, if you discover bugs, technical debt, missing features, or improvements
-that are NOT part of the current task, you MUST create GitHub issues for them.
+While working, if you discover ANY bugs, errors, or problems that are NOT part of your
+current task, you MUST search for existing issues and create new ones if none exist.
 
-**Process for each discovered issue:**
+**IMPORTANT:** "Pre-existing" issues still need to be tracked! If a problem exists in
+production (even if not caused by the current PR), it needs a GitHub issue so it can be fixed.
+
+**Process for EVERY issue discovered:**
 
 1. **Search first** - Check if an issue already exists:
    ```bash
    gh issue list --state open --search "keyword from the issue"
+   gh issue list --state closed --search "keyword from the issue"  # Also check closed
    ```
 
-2. **Only create if not found** - If no matching issue exists:
+2. **Only create if not found** - If no matching issue exists (open or recently closed):
    ```bash
    gh issue create --title "type: brief description" --body "$(cat <<'\''EOF'\''
    ## Description
@@ -1065,20 +1069,21 @@ that are NOT part of the current task, you MUST create GitHub issues for them.
 
 3. **Use appropriate prefixes**: bug:, feat:, refactor:, perf:, docs:, test:, chore:
 
-**Examples of issues to create:**
-- Bugs you notice but are unrelated to current work
+**MUST report these (search + create if not found):**
+- Console errors (React errors, JavaScript exceptions, network failures)
+- Broken functionality (pages not loading, features not working)
+- Hydration mismatches or React warnings
 - Security vulnerabilities
-- Performance issues
+- Performance issues (slow loading, memory leaks)
 - Missing error handling
-- Outdated dependencies
-- Code that should be refactored
-- Missing tests for existing code
-- Documentation gaps
+- Data loading failures
+- UI rendering issues
+- Any error messages in logs
 
 **Do NOT create issues for:**
 - Things that are part of your current task
 - Style preferences or nitpicks
-- Already known issues (check first!)
+- Issues that already exist in GitHub (always search first!)
 
 **Git commands note:** Always use --no-gpg-sign for commits (e.g., git commit --no-gpg-sign -m "message")
 '
@@ -2358,6 +2363,12 @@ Execute these phases from CLAUDE.md:
    b. Log in with QA account (zubzone+qa@gmail.com / 3294sdzadsg\$&\$§)
    c. Test that the new feature works in production
    d. Check browser console for errors
+
+6. **Report ANY issues discovered** (CRITICAL)
+   For ANY problems found during verification (console errors, broken features, data issues):
+   - Search GitHub for existing issues first
+   - Create new issues for anything not already tracked
+   - This includes "pre-existing" bugs not caused by this PR - they still need issues!
 
 $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 
