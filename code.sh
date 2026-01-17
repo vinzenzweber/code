@@ -1276,8 +1276,9 @@ get_linked_pr() {
 
     # Query GitHub timeline for cross-referenced PRs
     # Filter for events where another issue/PR references this one
-    local pr_num
-    pr_num=$(gh api "repos/$GITHUB_OWNER/$GITHUB_REPO/issues/$issue_num/timeline" \
+    local repo_path pr_num
+    repo_path=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || return 1
+    pr_num=$(gh api "repos/$repo_path/issues/$issue_num/timeline" \
         --jq '[.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null) | .source.issue.number] | first // empty' 2>/dev/null) || true
 
     if [ -n "$pr_num" ]; then
@@ -2587,6 +2588,11 @@ resume_from_phase() {
             resume_from_phase "$issue_num" "planning"
             ;;
         "planning")
+            # Check if plan actually exists; if not, re-run planning
+            if ! has_implementation_plan "$issue_num"; then
+                log "No implementation plan found, re-running planning..."
+                plan_implementation "$issue_num" "$issue_title" "$issue_body"
+            fi
             # Run implementation
             local new_pr
             if new_pr=$(implement_and_test "$issue_num"); then
