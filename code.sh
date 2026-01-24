@@ -132,6 +132,43 @@ header() { echo -e "\n${BOLD}${CYAN}$*${NC}" | tee -a "$LOG_FILE" >&2; }
 #   - SDK result errors: {"type":"result","subtype":"error_during_execution","errors":[...]}
 #     where errors array contains rate limit related messages
 #   - Hook denials: {"decision":"deny","reason":"Rate limit exceeded"} (exit code 2)
+# Global flag to track if prompt-too-long error occurred
+# This is set by detect_prompt_too_long_error and checked by callers
+PROMPT_TOO_LONG_ERROR=false
+
+# Detect "Prompt is too long" errors by parsing JSON output from Claude Code CLI
+# Returns 0 if prompt-too-long error detected, 1 otherwise
+# Sets PROMPT_TOO_LONG_ERROR=true when detected
+detect_prompt_too_long_error() {
+    local output_file="$1"
+
+    # Check for the specific error message in the output
+    if grep -qiE "Prompt is too long|prompt.*too.*long|context.*too.*long|token.*limit.*exceeded" "$output_file" 2>/dev/null; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] PROMPT TOO LONG ERROR DETECTED" >> "$LOG_FILE"
+        PROMPT_TOO_LONG_ERROR=true
+        return 0
+    fi
+
+    # Also check JSON errors for token/context limit issues
+    while IFS= read -r line; do
+        [[ "$line" != "{"* ]] && continue
+
+        local msg_type error_msg
+        msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+
+        if [ "$msg_type" = "error" ] || [ "$msg_type" = "result" ]; then
+            error_msg=$(echo "$line" | jq -r '.error.message // .errors[]? // empty' 2>/dev/null) || true
+            if echo "$error_msg" | grep -qiE "prompt.*too.*long|token.*limit|context.*length"; then
+                echo "[$(date +'%Y-%m-%d %H:%M:%S')] PROMPT TOO LONG ERROR DETECTED: $error_msg" >> "$LOG_FILE"
+                PROMPT_TOO_LONG_ERROR=true
+                return 0
+            fi
+        fi
+    done < "$output_file"
+
+    return 1
+}
+
 detect_rate_limit_error() {
     local output_file="$1"
 
@@ -1110,13 +1147,20 @@ format_progress() {
 }
 
 # Wrapper for claude command
-# Always runs with --dangerously-skip-permissions and --model opus
+# Runs with --dangerously-skip-permissions
 # Uses streaming JSON output for progress display
 # Logs all raw JSON output to LOG_FILE for debugging
 # Handles rate limits and session limits with automatic retry
+# Args: prompt [model]
+#   model: optional, defaults to "sonnet" (use "opus" for implementation)
 run_claude() {
+    local prompt="$1"
+    local model="${2:-sonnet}"  # Default to sonnet, pass "opus" for implementation
     local prompt_preview
-    prompt_preview=$(printf '%s' "$1" | head -c 100 | tr '\n' ' ') 2>/dev/null
+    prompt_preview=$(printf '%s' "$prompt" | head -c 100 | tr '\n' ' ') 2>/dev/null
+
+    # Reset prompt-too-long flag at start of each session
+    PROMPT_TOO_LONG_ERROR=false
 
     local max_retries=50  # Max retries for rate limits (can wait up to ~8 hours)
     local retry_count=0
@@ -1131,7 +1175,7 @@ run_claude() {
         # Log session start
         echo "" >> "$LOG_FILE"
         echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION START (attempt $((retry_count + 1)))" >> "$LOG_FILE"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] CLAUDE SESSION START (attempt $((retry_count + 1)), model: $model)" >> "$LOG_FILE"
         echo "Prompt: ${prompt_preview}..." >> "$LOG_FILE"
         echo "═══════════════════════════════════════════════════════════════════" >> "$LOG_FILE"
 
@@ -1143,7 +1187,7 @@ run_claude() {
         output_file=$(mktemp)
 
         # All sessions use print mode with streaming JSON for progress display
-        claude --dangerously-skip-permissions --model opus --verbose -p --output-format stream-json "$@" 2>&1 | tee -a "$LOG_FILE" | tee "$output_file" | format_progress
+        claude --dangerously-skip-permissions --model "$model" --verbose -p --output-format stream-json "$prompt" 2>&1 | tee -a "$LOG_FILE" | tee "$output_file" | format_progress
 
         local exit_code=${PIPESTATUS[0]}
 
@@ -1182,6 +1226,13 @@ run_claude() {
             printf "\r${GREEN}  ✓ Resuming after rate limit wait${NC}                    \n" >&2
 
             continue  # Retry the claude call
+        fi
+
+        # Check for prompt-too-long error (non-retryable)
+        if [ $exit_code -ne 0 ] && detect_prompt_too_long_error "$output_file"; then
+            error "Prompt is too long - cannot continue this session"
+            rm -f "$output_file"
+            return 1
         fi
 
         rm -f "$output_file"
@@ -1813,7 +1864,7 @@ $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 IMPORTANT: After creating the PR, output EXACTLY this format on its own line:
 PR_CREATED: <number>
 Example: PR_CREATED: 123
-" > /dev/null  # Discard stdout - we find PR via git/gh commands below
+" "opus" > /dev/null  # Discard stdout - we find PR via git/gh commands below (using opus for implementation)
 
     local session_end
     session_end=$(date +%s)
@@ -2078,6 +2129,12 @@ Output 'CI_FIXES_PUSHED' when fixes are committed and pushed.
     local session_end
     session_end=$(date +%s)
 
+    # Skip posting session memory if prompt was too long (non-recoverable error)
+    if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+        error "CI fix failed: prompt too long"
+        return 1
+    fi
+
     # Post session memory
     post_session_memory "$issue_num" "Fix CI Failures (Attempt $attempt)" "$session_start" "$session_end" "${SESSION_COST:-0}" \
         "Analyzed CI failures and pushed fixes for PR #$pr_num."
@@ -2119,6 +2176,12 @@ run_ci_fix_loop() {
 
         log "CI failed, attempting fix ($attempt/$MAX_CI_FIX_ATTEMPTS)..."
         fix_ci_failures "$pr_num" "$issue_num" "$attempt"
+
+        # Check if fix attempt failed due to prompt-too-long (non-recoverable)
+        if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+            error "CI fix failed: prompt too long - cannot continue"
+            return 1
+        fi
 
         # Brief pause before re-checking CI
         log "Waiting for new CI run to start..."
@@ -2309,6 +2372,12 @@ Be thorough but fair. Only request changes for real issues, not style preference
     local session_end
     session_end=$(date +%s)
 
+    # Skip posting session memory if prompt was too long (non-recoverable error)
+    if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+        error "Review failed: prompt too long"
+        return 1
+    fi
+
     # Post session memory
     post_session_memory "$issue_num" "Code Review" "$session_start" "$session_end" "${SESSION_COST:-0}" \
         "Reviewed PR #$pr_num (round $next_round)"
@@ -2424,6 +2493,12 @@ Output 'FIXES_COMPLETE' when all fixes are complete and pushed.
 
     local session_end
     session_end=$(date +%s)
+
+    # Skip posting session memory if prompt was too long (non-recoverable error)
+    if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+        error "Fix feedback failed: prompt too long"
+        return 1
+    fi
 
     # Update phase back to pr-waiting for CI
     set_phase "$issue_num" "pr-waiting"
@@ -2880,9 +2955,21 @@ run_review_loop() {
             return 0
         fi
 
+        # Check if review failed due to prompt-too-long (non-recoverable)
+        if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+            mark_blocked "$issue_num" "Prompt too long - review history has grown too large"
+            return 1
+        fi
+
         if [ "$review_round" -lt "$MAX_REVIEW_ROUNDS" ]; then
             # Fix feedback
             fix_review_feedback "$pr_num" "$issue_num"
+
+            # Check if fix attempt failed due to prompt-too-long (non-recoverable)
+            if [ "$PROMPT_TOO_LONG_ERROR" = true ]; then
+                mark_blocked "$issue_num" "Prompt too long - review history has grown too large"
+                return 1
+            fi
 
             # Re-run CI after fixes (with fix loop)
             if ! run_ci_fix_loop "$pr_num" "$issue_num"; then
