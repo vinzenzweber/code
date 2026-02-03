@@ -735,7 +735,7 @@ triage_feedback_issue() {
     issue_body=$(echo "$issue_json" | jq -r '.body // ""' 2>/dev/null) || issue_body=""
 
     local raw_output
-    raw_output=$(run_claude "
+    raw_output=$(run_claude "$(cat <<'PROMPT'
 You are triaging a user feedback issue for the habits/fitstreak project.
 
 ## Issue #$issue_num: $issue_title
@@ -798,7 +798,8 @@ Where:
 - 'close': Feedback fully addressed by child issues or existing issues, can close parent
 - 'convert_to_epic': Large scope, rename to 'Epic: ...' and keep open as tracker
 - 'needs_clarification': Asked user for more info, pause triage
-")
+PROMPT
+)")
 
     local session_end
     session_end=$(date +%s)
@@ -1341,7 +1342,7 @@ Follow the user's instruction above when selecting which issue to work on.
     fi
 
     local raw_output
-    raw_output=$(run_claude "
+    raw_output=$(run_claude "$(cat <<'PROMPT'
 You are selecting a GitHub issue to work on for the habits/fitstreak project.
 $hint_section
 1. Fetch open issues: gh issue list --state open --json number,title,body,labels,assignees --limit 50
@@ -1362,7 +1363,8 @@ Do NOT return null unless there are literally zero open issues after filtering.
 
 Output ONLY a JSON object (no markdown, no explanation, no code blocks):
 {\"number\": 123, \"title\": \"Issue title\", \"body\": \"Issue description\"}
-")
+PROMPT
+)")
 
     local session_end
     session_end=$(date +%s)
@@ -1567,7 +1569,7 @@ plan_implementation() {
 
     # Generate plan using print mode (non-interactive)
     local plan
-    plan=$(run_claude "
+    plan=$(run_claude "$(cat <<'PROMPT'
 Plan the implementation for GitHub issue #$issue_num
 
 **Issue Title:** $issue_title
@@ -1660,7 +1662,8 @@ The output MUST follow this EXACT structure:
 2. Do NOT output anything before the start marker
 3. Do NOT output anything after the end marker
 4. Use ## for section headers (h2), not # (h1)
-")
+PROMPT
+)")
 
     local session_end
     session_end=$(date +%s)
@@ -1743,7 +1746,8 @@ implement_and_test() {
     local session_start
     session_start=$(date +%s)
 
-    run_claude "
+    local implementation_prompt
+    implementation_prompt=$(cat <<'PROMPT'
 Implement GitHub issue #$issue_num following the approved plan below.
 
 $implementation_plan
@@ -1864,7 +1868,9 @@ $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 IMPORTANT: After creating the PR, output EXACTLY this format on its own line:
 PR_CREATED: <number>
 Example: PR_CREATED: 123
-" "opus" > /dev/null  # Discard stdout - we find PR via git/gh commands below (using opus for implementation)
+PROMPT
+)
+    run_claude "$implementation_prompt" "opus" > /dev/null  # Discard stdout - we find PR via git/gh commands below (using opus for implementation)
 
     local session_end
     session_end=$(date +%s)
@@ -2073,7 +2079,7 @@ fix_ci_failures() {
     local failed_jobs
     failed_jobs=$(echo "$ci_checks" | grep -E "fail|X" | head -5 || echo "")
 
-    run_claude "
+    run_claude "$(cat <<'PROMPT'
 Fix the CI failures for PR #$pr_num (Attempt $attempt of $MAX_CI_FIX_ATTEMPTS).
 
 ## Current CI Status
@@ -2124,7 +2130,8 @@ $failed_jobs
 $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 
 Output 'CI_FIXES_PUSHED' when fixes are committed and pushed.
-" > /dev/null
+PROMPT
+)" > /dev/null
 
     local session_end
     session_end=$(date +%s)
@@ -2268,7 +2275,7 @@ $review_history
 "
     fi
 
-    run_claude "
+    run_claude "$(cat <<'PROMPT'
 You are a senior code reviewer examining PR #$pr_num (Review Round $next_round).
 
 **CRITICAL**: You did NOT write this code. Review it with fresh eyes.
@@ -2367,7 +2374,8 @@ gh issue edit $issue_num --add-label 'auto-dev:signal:review-changes'
 \`\`\`
 
 Be thorough but fair. Only request changes for real issues, not style preferences.
-" > /dev/null  # Output discarded - status determined by label
+PROMPT
+)" > /dev/null  # Output discarded - status determined by label
 
     local session_end
     session_end=$(date +%s)
@@ -2433,7 +2441,7 @@ fix_review_feedback() {
     local review_history
     review_history=$(gh issue view "$issue_num" --comments --json comments -q '.comments[].body' 2>/dev/null | grep -A 100 "Code Review Round" | head -200) || review_history=""
 
-    run_claude "
+    run_claude "$(cat <<'PROMPT'
 Fix the code review feedback for PR #$pr_num (Review Round $review_round).
 
 ## IMPORTANT: Review History Context
@@ -2489,7 +2497,8 @@ After ALL fixes:
 $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 
 Output 'FIXES_COMPLETE' when all fixes are complete and pushed.
-" > /dev/null  # Discard stdout - no output capture needed
+PROMPT
+)" > /dev/null  # Discard stdout - no output capture needed
 
     local session_end
     session_end=$(date +%s)
@@ -2542,7 +2551,7 @@ merge_and_verify() {
     local session_start
     session_start=$(date +%s)
 
-    run_claude "
+    run_claude "$(cat <<'PROMPT'
 Merge and verify PR #$pr_num in production.
 
 Execute these phases from CLAUDE.md:
@@ -2612,7 +2621,8 @@ Execute these phases from CLAUDE.md:
 $(echo "$NEW_ISSUE_INSTRUCTIONS" | sed "s/CURRENT_ISSUE/$issue_num/g")
 
 Output 'DEPLOYMENT_VERIFIED' when verification is complete, or 'DEPLOYMENT_FAILED' if there were issues.
-" > /dev/null  # Discard stdout - no output capture needed
+PROMPT
+)" > /dev/null  # Discard stdout - no output capture needed
 
     local session_end
     session_end=$(date +%s)
@@ -2657,8 +2667,9 @@ update_documentation() {
     local session_start
     session_start=$(date +%s)
 
-    run_claude "
-Analyze if documentation updates are needed for issue #$issue_num.
+    local doc_check_prompt
+    doc_check_prompt=$(cat <<'PROMPT'
+Analyze whether documentation updates are needed for issue #$issue_num.
 
 You are on the feature branch. Any doc updates will be part of the PR.
 
@@ -2670,25 +2681,16 @@ Check if CLAUDE.md should be updated for:
 - New database tables or migrations
 - New API endpoints
 
-Be conservative - only suggest updates for significant changes.
-
-## REQUIRED ACTION
-
 If documentation DOES need updating, add a signal label:
-\`\`\`bash
-gh issue edit $issue_num --add-label 'auto-dev:signal:needs-update'
-\`\`\`
+  gh issue edit $issue_num --add-label "auto-dev:signal:needs-update"
 
-If documentation does NOT need updating, do nothing (no label needed).
+If documentation does NOT need updating, do nothing (no label).
 
 Post a brief comment explaining your decision:
-\`\`\`bash
-gh issue comment $issue_num --body '## 📚 Documentation Check
-
-**Needs update:** YES/NO
-**Reason:** Brief explanation'
-\`\`\`
-" > /dev/null
+  gh issue comment $issue_num --body "Documentation Check: Needs update YES/NO. Reason: <short reason>"
+PROMPT
+)
+    run_claude "$doc_check_prompt" > /dev/null
 
     local session_end
     session_end=$(date +%s)
@@ -2701,33 +2703,35 @@ gh issue comment $issue_num --body '## 📚 Documentation Check
         local doc_session_start
         doc_session_start=$(date +%s)
 
-        run_claude "
+        local doc_update_prompt
+        doc_update_prompt=$(cat <<'PROMPT'
 Update CLAUDE.md based on changes from issue #$issue_num.
 
 You are on the feature branch. Doc changes will be part of the PR.
 
 Check the previous comment on the issue for the reason documentation needs updating:
-  gh issue view $issue_num --comments --json comments -q '.comments[-1].body'
+  gh issue view $issue_num --comments --json comments -q ".comments[-1].body"
 
 Guidelines:
 - Keep updates minimal and focused
 - Follow the existing format and style
-- Don't add redundant information
+- Do not add redundant information
 - Update existing sections rather than adding new ones when possible
 
 After updating:
 1. git add CLAUDE.md
-2. git commit --no-gpg-sign -m 'docs: update CLAUDE.md'
+2. git commit --no-gpg-sign -m "docs: update CLAUDE.md"
 3. git push
 
-Output 'DOCS_UPDATED' when complete.
-" > /dev/null
+Output "DOCS_UPDATED" when complete.
+PROMPT
+)
+        run_claude "$doc_update_prompt" > /dev/null
 
         local doc_session_end
         doc_session_end=$(date +%s)
 
-        post_session_memory "$issue_num" "Documentation" "$doc_session_start" "$doc_session_end" "${SESSION_COST:-0}" \
-            "Updated CLAUDE.md based on issue changes"
+        post_session_memory "$issue_num" "Documentation" "$doc_session_start" "$doc_session_end" "${SESSION_COST:-0}"             "Updated CLAUDE.md based on issue changes"
 
         success "Documentation updated - CI will re-run"
         return 1  # Signal that docs were updated, caller should wait for CI
@@ -2737,8 +2741,7 @@ Output 'DOCS_UPDATED' when complete.
     fi
 
     # Post session memory for the check
-    post_session_memory "$issue_num" "Documentation Check" "$session_start" "$session_end" "${SESSION_COST:-0}" \
-        "Checked if documentation updates needed"
+    post_session_memory "$issue_num" "Documentation Check" "$session_start" "$session_end" "${SESSION_COST:-0}"         "Checked if documentation updates needed"
 }
 
 #─────────────────────────────────────────────────────────────────────
@@ -2757,19 +2760,25 @@ complete_issue() {
     set_metadata "$issue_num" "cost" "$total_cost"
 
     # Close the issue with a summary
-    gh issue close "$issue_num" --comment "## ✅ Completed by Auto-Dev
+    local completed_at close_comment
+    completed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    close_comment=$(cat <<EOF
+## ✅ Completed by Auto-Dev
 
 | Metric | Value |
 |--------|-------|
 | **PR** | #$pr_num |
 | **Total Cost** | \$$total_cost |
-| **Completed** | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |
+| **Completed** | $completed_at |
 
 ### Session Summary
 See comments above for detailed session logs.
 
 ---
-<sub>🤖 Automated by auto-dev</sub>" >/dev/null 2>&1 || warn "Failed to close issue"
+<sub>🤖 Automated by auto-dev</sub>
+EOF
+)
+    gh issue close "$issue_num" --comment "$close_comment" >/dev/null 2>&1 || warn "Failed to close issue"
 
     success "Issue #$issue_num completed! Total cost: \$$total_cost"
 }
@@ -2910,7 +2919,6 @@ resume_from_phase() {
             ;;
     esac
 }
-
 run_review_loop() {
     local issue_num=$1
     local pr_num=$2
